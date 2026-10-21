@@ -53,6 +53,26 @@ byte-identical to HEAD; the 1.2x window cut back out of a 2.0x / 448 crop
 matches today's 224 crop at 42.2 dB mean (sigma-1 blur, padding masked) with
 a 0.09 px shift. At 2.0x, 195 of 200 AIC squares reach past the frame edge.
 
+`--windows K --window-sizes 224,288` stores PRECOMPUTED WINDOWS instead (the
+v4 preset): K square windows per person, each cut from the full-resolution
+photo with ONE resize -- the same operation as the runtime crop, so the training
+texture is the deployment texture (a 448 px context crop plus a second warp
+was not: STATUS.md 2026-10-21). Window 0 is the 1.2x square of the tight box
+with the RUNTIME's rounding (floor / ceil, instanthmr/inference.py), i.e. the
+crop the phone cuts for a perfect detector box -- within 1 px of bbox_square,
+whose int() edges the runtime does not use; windows 1..K-1 are v3 framings (side log-uniform in
+0.6-2.0 x the tight box, centre shifted up to +/-15% of the side), padded black
+only where they leave the photo. Each size is written to its own folder
+(--output-dir with a `{size}` placeholder) as one tile per person, K windows
+side by side (K*S x S px). One key is added:
+
+    win_boxes       (K, 4)  the windows, full-frame px, integer; rows 1.. are
+                            exact squares, row 0 is the runtime box (which its
+                            floor / ceil can leave 1 px off square)
+
+The boxes are seeded by the person's name, so every size, rerun and resume
+draws the same ones.
+
 Hand crops are stored UNFLIPPED. SAM3D trains a single right-hand model and
 mirrors the left at inference; flipping a loaded crop is a free numpy slice, so
 baking the mirror into disk would only remove a choice.
@@ -65,10 +85,12 @@ baking the mirror into disk would only remove a choice.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import re
 import shutil
 import sys
+import zlib
 from pathlib import Path
 
 import cv2
@@ -163,6 +185,44 @@ def enough_inside(sq: np.ndarray, h: int, w: int, min_frac: float) -> bool:
     return ((ix2 - ix1) * (iy2 - iy1)) / max(area, 1e-6) >= min_frac
 
 
+# v3's framing range, as multiples of the tight box (1.2 = the standard crop),
+# and its centre shift as a fraction of the window side.
+WINDOW_BOX = (0.6, 2.0)
+WINDOW_SHIFT = 0.15
+
+
+def window_boxes(tight: np.ndarray, k: int, name: str) -> np.ndarray:
+    """Row 0 is the runtime's 1.2x box of `tight`; rows 1..k-1 are random v3
+    framings, integer and exactly square, in frame px. Seeded by `name`, so
+    reruns agree."""
+    rng = np.random.default_rng(zlib.crc32(name.encode()))
+    x1, y1, x2, y2 = (float(v) for v in tight)
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    b = max(x2 - x1, y2 - y1)
+    # instanthmr.inference.InstantHMR._preprocess, line for line
+    sq_size = b * 1.2
+    sx, sy = cx - sq_size / 2.0, cy - sq_size / 2.0
+    out = [np.array([math.floor(sx), math.floor(sy), math.ceil(sx + sq_size),
+                     math.ceil(sy + sq_size)], dtype=np.float32)]
+    for _ in range(k - 1):
+        m = math.exp(rng.uniform(math.log(WINDOW_BOX[0]), math.log(WINDOW_BOX[1])))
+        side = max(8, int(round(m * b)))
+        wx = cx + rng.uniform(-WINDOW_SHIFT, WINDOW_SHIFT) * side
+        wy = cy + rng.uniform(-WINDOW_SHIFT, WINDOW_SHIFT) * side
+        x1, y1 = int(round(wx - side / 2.0)), int(round(wy - side / 2.0))
+        out.append(np.array([x1, y1, x1 + side, y1 + side], dtype=np.float32))
+    return np.stack(out)
+
+
+def cut_box(img_rgb: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """The integer box `box` of the photo, black-padded where it leaves it."""
+    h, w = img_rgb.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in box)
+    crop = img_rgb[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+    return cv2.copyMakeBorder(crop, max(0, -y1), max(0, y2 - h), max(0, -x1),
+                              max(0, x2 - w), cv2.BORDER_CONSTANT, value=(0, 0, 0))
+
+
 def write_crop(img_rgb, box, size, path: Path) -> None:
     crop, _ = get_square_crop_padded(img_rgb, box, expand=1.0)
     crop = cv2.resize(crop, (size, size), interpolation=cv2.INTER_LINEAR)
@@ -203,6 +263,13 @@ def parse_args() -> argparse.Namespace:
                         "as bbox_context (full-frame px) plus context_padded; "
                         "bbox_square stays the 1.2x square, so the standard window "
                         "can always be cut back out.")
+    p.add_argument("--windows", type=int, default=0, metavar="K",
+                   help="store K precomputed windows per person (window 0 = the "
+                        "standard 1.2x crop, 1..K-1 = v3 framings), each cut from "
+                        "the photo with one resize. Needs --window-sizes, "
+                        "--no-hands and an --output-dir containing {size}.")
+    p.add_argument("--window-sizes", default="224,288",
+                   help="with --windows: comma-separated tile sizes, one folder each")
     p.add_argument("--crop-format", choices=("png", "jpg"), default="png",
                    help="png keeps body_crops byte-identical to the existing "
                         "data/ tree; jpg is ~5x smaller and ~4x faster to decode")
@@ -257,30 +324,44 @@ def main() -> None:
     if args.context != 1.2 and args.output_dir is None:
         sys.exit(f"--context {args.context} needs an explicit --output-dir, so the "
                  f"context crops never land in the standard {out_dir.name}")
-    first = next((out_dir / "annotations").glob("*.npz"), None)
-    if first is not None:
-        with np.load(first) as z:
-            was_context = "bbox_context" in z.files
-        if was_context != (args.context != 1.2):
-            sys.exit(f"{out_dir} already holds {'context' if was_context else 'standard'} "
-                     f"crops; refusing to add {'standard' if was_context else 'context'} ones")
+    win_sizes = [int(v) for v in args.window_sizes.split(",")] if args.windows else []
+    if args.windows:
+        if args.windows < 2 or args.context != 1.2 or args.hands:
+            sys.exit("--windows needs K >= 2, the default --context and --no-hands")
+        if args.output_dir is None or "{size}" not in str(args.output_dir):
+            sys.exit("--windows needs an --output-dir containing {size}, e.g. "
+                     "$SCRATCH/instanthmr/data_win{size}/sam3d_gt_aic")
+        out_dirs = [Path(str(args.output_dir).format(size=s)) for s in win_sizes]
+    else:
+        out_dirs = [out_dir]
+    out_dir = out_dirs[0]
+    kind = "windows" if args.windows else "context" if args.context != 1.2 else "standard"
+    for d in out_dirs:
+        first = next((d / "annotations").glob("*.npz"), None)
+        if first is not None:
+            with np.load(first) as z:
+                was = ("windows" if "win_boxes" in z.files else
+                       "context" if "bbox_context" in z.files else "standard")
+            if was != kind:
+                sys.exit(f"{d} already holds {was} crops; refusing to add {kind} ones")
 
+    for d in out_dirs:
+        for k in ("original_images", "annotations", "body_crops", "hands_crops"):
+            if k == "original_images" and (args.originals == "none" or d != out_dir):
+                continue
+            if k == "hands_crops" and not args.hands:
+                continue
+            (d / k).mkdir(parents=True, exist_ok=True)
+
+        # Let the unmodified training script discover this folder.
+        compat = d / "images"
+        if not compat.exists():
+            try:
+                os.symlink("body_crops", compat)
+            except FileExistsError:
+                pass  # another array task won the race
     dirs = {k: out_dir / k for k in
             ("original_images", "annotations", "body_crops", "hands_crops")}
-    for k, d in dirs.items():
-        if k == "original_images" and args.originals == "none":
-            continue
-        if k == "hands_crops" and not args.hands:
-            continue
-        d.mkdir(parents=True, exist_ok=True)
-
-    # Let the unmodified training script discover this folder.
-    compat = out_dir / "images"
-    if not compat.exists():
-        try:
-            os.symlink("body_crops", compat)
-        except FileExistsError:
-            pass  # another array task won the race
 
     parquets = sorted(args.annotation_dir.glob("*.parquet"))
     if not parquets:
@@ -299,7 +380,8 @@ def main() -> None:
     ext = args.crop_format
     imwrite_params = ([int(cv2.IMWRITE_JPEG_QUALITY), args.jpg_quality]
                       if ext == "jpg" else [])
-    existing = {p.stem for p in dirs["annotations"].glob("*.npz")}
+    # The last folder's npz is written last, so it marks a finished person.
+    existing = {p.stem for p in (out_dirs[-1] / "annotations").glob("*.npz")}
     total = len(existing)
     st = {k: 0 for k in ("crops", "hands_l", "hands_r", "hand_too_small",
                          "hand_out_of_frame", "hand_occluded", "skipped_existing",
@@ -378,11 +460,18 @@ def main() -> None:
                     ann["context_padded"] = np.array(
                         bool(ctx_bbox[0] < 0 or ctx_bbox[1] < 0
                              or ctx_bbox[2] > w or ctx_bbox[3] > h))
-                body_crop = cv2.resize(body_crop, (args.body_size, args.body_size),
-                                       interpolation=cv2.INTER_LINEAR)
-                cv2.imwrite(str(dirs["body_crops"] / f"{name}.{ext}"),
-                            cv2.cvtColor(body_crop, cv2.COLOR_RGB2BGR),
-                            imwrite_params)
+                if args.windows:
+                    ann["win_boxes"] = window_boxes(ann["bbox"], args.windows, name)
+                    crops = [cut_box(img_rgb, b) for b in ann["win_boxes"]]
+                    tiles = [np.hstack([cv2.resize(c, (s, s), interpolation=cv2.INTER_LINEAR)
+                                        for c in crops]) for s in win_sizes]
+                else:
+                    tiles = [cv2.resize(body_crop, (args.body_size, args.body_size),
+                                        interpolation=cv2.INTER_LINEAR)]
+                for d, tile in zip(out_dirs, tiles):
+                    cv2.imwrite(str(d / "body_crops" / f"{name}.{ext}"),
+                                cv2.cvtColor(tile, cv2.COLOR_RGB2BGR),
+                                imwrite_params)
 
                 ann["bbox_square"] = sq_bbox
                 ann["image_relpath"] = relpath
@@ -419,7 +508,8 @@ def main() -> None:
                     ann[f"hand_valid_{side}"] = np.array(True)
                     st[f"hands_{side}"] += 1
 
-                np.savez(dirs["annotations"] / f"{name}.npz", **ann)
+                for d in out_dirs:
+                    np.savez(d / "annotations" / f"{name}.npz", **ann)
                 if args.originals != "none":
                     place_original(args.image_dir / relpath,
                                    dirs["original_images"] / relpath,

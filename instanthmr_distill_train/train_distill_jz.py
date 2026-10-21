@@ -397,7 +397,8 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
                 image_size=cfg.image_size,
                 context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
-                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift)
+                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
+                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows)
 
     # Rank 0 builds the index (or reads the cache) while the others wait, then
     # everyone loads the same cache. Building on all ranks at once would put
@@ -710,6 +711,7 @@ def train(args, cfg, rank, local_rank, world):
             "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
             "image_size": cfg.image_size, "context_crops": cfg.context_crops,
             "v3_box": [cfg.v3_box_min, cfg.v3_box_max], "v3_shift": cfg.v3_shift,
+            "v3_lanczos": cfg.v3_lanczos, "crop_windows": cfg.crop_windows,
             "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
             "exact_landmarks": cfg.exact_landmarks,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
@@ -1144,6 +1146,10 @@ def parse_args():
     p.add_argument("--w_simcc", type=float, default=None)
     p.add_argument("--weight_decay", type=float, default=None)
     p.add_argument("--backbone", default=None)
+    p.add_argument("--v3-lanczos", dest="v3_lanczos", action="store_true",
+                   help="--preset v3: cut the training window with Lanczos instead of "
+                        "bilinear, so training crops are as sharp as val/phone crops. "
+                        "Use for every new v3 run.")
     p.add_argument("--image-size", dest="image_size", type=int, default=None,
                    help="Network input side in px (default 224). A multiple of "
                         "32: the decoder's positional grid is image_size // 32. "
@@ -1162,13 +1168,17 @@ def parse_args():
                    help="Skip the timm download. Compute nodes have no internet, "
                         "so run --warm-cache once on a login node instead.")
     p.add_argument("--log-every", type=int, default=100)
-    p.add_argument("--preset", choices=["baseline", "v2", "v3"], default="baseline",
+    p.add_argument("--preset", choices=["baseline", "v2", "v3", "v4"], default="baseline",
                    help="'v2' enables the wave-1 bundle: truncation, occlusion "
                         "and JPEG augmentation with the SimCC-mask and CLIFF "
                         "prerequisites, plus absolute-pose supervision. "
                         "'v3' is v2 with every crop sampled from a context-crop "
                         "split over a wide range of framings (needs --data_root "
                         "of build_split.py --context splits). "
+                        "'v4' gives v3's framings from precomputed windows cut "
+                        "like the runtime crop (needs a build_split.py --windows "
+                        "corpus at --image-size), v2's occlusion/JPEG, baseline "
+                        "geometry and baseline loss weights. "
                         "'baseline' reproduces the pre-v2 trainer exactly.")
     p.add_argument("--w_reproj", type=float, default=None)
     p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true",
@@ -1263,6 +1273,7 @@ def build_cfg(args):
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
     if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
     if args.ema_decay is not None:  cfg.ema_decay = args.ema_decay
+    if args.v3_lanczos: cfg.v3_lanczos = True
     if args.image_size is not None:
         if args.image_size % 32:
             raise SystemExit(f"--image-size {args.image_size} is not a multiple of 32")
@@ -1272,6 +1283,8 @@ def build_cfg(args):
         apply_v2_preset(cfg)
     if args.preset == "v3":
         apply_v3_preset(cfg)
+    if args.preset == "v4":
+        apply_v4_preset(cfg)
     # Orthogonal axis: --preset is the input pipeline + absolute-pose terms,
     # --losses is the loss budget. Applied second so it owns w_keypoints3d.
     if args.losses == "rebalanced":
@@ -1330,6 +1343,29 @@ def apply_v3_preset(cfg) -> None:
     cfg.v3_shift = 0.15
     # The window's CLIFF vector is built in the perspective-correct form; the
     # pixel form is ambiguous on this corpus's real focals. Mandatory, not a flag.
+    cfg.cliff_focal = True
+
+
+def apply_v4_preset(cfg) -> None:
+    """v3's framings without v3's texture, on baseline loss weights.
+
+    Each crop is one of K windows build_split.py --windows cut from the
+    full-resolution photo with a single resize, like the runtime crop: window 0
+    is the standard 1.2x crop, the others v3 framings. v3 cut its windows from a
+    448 px context crop with a second warp, and its models learned that texture
+    (3DPW val J14 PA, g9_b4_224 ep314: 49.3 on crops cut from the frame vs 43.6
+    on crops built its own way; g8h 40.0 vs 39.4, STATUS.md 2026-10-21).
+
+    On top: v2's occlusion and JPEG with the two prerequisites truncated
+    framings need, and baseline geometry (the windows already supply the zoom
+    and shift). The loss weights stay the baseline ones -- no v2 item 3."""
+    cfg.crop_windows = True
+    cfg.cliff_follows_aug = True
+    cfg.mask_oob_2d = True
+    cfg.occl_p = 0.7
+    cfg.occl_scale = (0.02, 0.30)
+    cfg.jpeg_p = 0.3
+    cfg.jpeg_quality = (30, 90)
     cfg.cliff_focal = True
 
 

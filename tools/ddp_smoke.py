@@ -55,6 +55,9 @@ def main() -> int:
     p.add_argument("--context-crops", dest="context_crops", action="store_true",
                    help="--preset v3's dataset; --data_root must be a context-crop "
                         "split (build_split.py --context 2.0 --body-size 448)")
+    p.add_argument("--crop-windows", dest="crop_windows", action="store_true",
+                   help="--preset v4's dataset; --data_root must be a window "
+                        "split (build_split.py --windows 4) at --image-size")
     p.add_argument("--image-size", dest="image_size", type=int, default=None,
                    help="network input side; the positional grid and every crop follow it")
     p.add_argument("--data_root", default="data")
@@ -113,7 +116,8 @@ def main() -> int:
                                per_dataset_caps={}, cliff_focal=cfg.cliff_focal,
                                crop_centre_fix=cfg.crop_centre_fix,
                                image_size=cfg.image_size,
-                               context_crops=args.context_crops)
+                               context_crops=args.context_crops,
+                               crop_windows=args.crop_windows)
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     batch = {k: (v.to(T.device) if torch.is_tensor(v) else v)
              for k, v in next(iter(loader)).items()}

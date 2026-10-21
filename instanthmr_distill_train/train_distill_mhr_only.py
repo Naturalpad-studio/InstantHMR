@@ -178,6 +178,19 @@ class DistillConfig:
     v3_box_min: float = 0.6
     v3_box_max: float = 2.0
     v3_shift: float = 0.15
+    # Lanczos instead of bilinear for the v3 window cut. Bilinear after the
+    # stored crop's own resize left v3 training crops at 0.73 (224) / 0.67 (288)
+    # of the sharpness of a crop cut straight from the photo (val3dpw and the
+    # phone do the latter); Lanczos gives 1.00 / 0.94. Measured 2026-10-20 on 300
+    # AIC people. Bilinear-trained g9 models lost 3-5 mm (224) and up to 17 mm
+    # (288) on sharp tight-box crops. Off by default so in-flight g9 runs resume
+    # unchanged.
+    v3_lanczos: bool = False
+    # --preset v4: each image is a tile of K windows that build_split.py
+    # --windows cut from the full-resolution photo with ONE resize, the same
+    # operation as the runtime crop; one window is drawn per sample (window 0,
+    # the standard 1.2x crop, when not augmenting).
+    crop_windows: bool = False
     max_images: int | None = None   
     per_dataset_caps: dict = field(default_factory=lambda: {"sam3d_gt_harmony4d": 300_000})
     val_split: float = 0.1
@@ -616,8 +629,11 @@ class SAM3DStudentDataset(Dataset):
                  occl_p: float = 0.2, occl_scale: tuple = (0.02, 0.15),
                  jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90),
                  context_crops: bool = False, v3_box_min: float = 0.6,
-                 v3_box_max: float = 2.0, v3_shift: float = 0.15):
+                 v3_box_max: float = 2.0, v3_shift: float = 0.15,
+                 v3_lanczos: bool = False, crop_windows: bool = False):
         super().__init__()
+        self.crop_windows = crop_windows
+        self.v3_interp = cv2.INTER_LANCZOS4 if v3_lanczos else cv2.INTER_LINEAR
         self.image_size = image_size
         self.context_crops = context_crops
         self.v3_box_min, self.v3_box_max, self.v3_shift = v3_box_min, v3_box_max, v3_shift
@@ -722,7 +738,7 @@ class SAM3DStudentDataset(Dataset):
         """v3 samples from context crops. A standard 224 split would still
         'work' -- with the 1.2x crop read as if it were the context, i.e. every
         box silently 1.67x too large -- so refuse it up front."""
-        if not self.context_crops or len(self.pairs) == 0:
+        if not (self.context_crops or self.crop_windows) or len(self.pairs) == 0:
             return
         # One probe per sub-folder, so a --data_root mixing context and
         # standard splits fails here and not hours in, inside a worker.
@@ -737,6 +753,19 @@ class SAM3DStudentDataset(Dataset):
         for k in probes:
             npz = Path(self.pairs[k][1])
             with np.load(npz) as z:
+                if self.crop_windows:
+                    if "win_boxes" not in z.files:
+                        raise ValueError(
+                            f"{npz.parent.parent.name}: {npz.name} has no win_boxes. "
+                            f"--preset v4 needs a window split, built with "
+                            f"build_split.py --windows 4 --window-sizes 224,288 ...")
+                    tw, th = Image.open(self.pairs[k][0]).size
+                    if th != self.image_size or tw != th * len(z["win_boxes"]):
+                        raise ValueError(
+                            f"{npz.parent.parent.name}: tile {tw}x{th} does not hold "
+                            f"{len(z['win_boxes'])} windows of {self.image_size} px; "
+                            f"use the data_win{self.image_size} corpus")
+                    continue
                 if "bbox_context" not in z.files:
                     raise ValueError(
                         f"{npz.parent.parent.name}: {npz.name} has no bbox_context. "
@@ -836,7 +865,7 @@ class SAM3DStudentDataset(Dataset):
                       [0.0, ay * ky, (0.5 * ay + ctx[1] - sq[1]) * ky - 0.5]])
         A, t = M_total[:, :2], M_total[:, 2]
         M_img = np.hstack([A @ C[:, :2], (A @ C[:, 2] + t)[:, None]])
-        img_np = cv2.warpAffine(ctx_np, M_img, (W, H), flags=cv2.INTER_LINEAR,
+        img_np = cv2.warpAffine(ctx_np, M_img, (W, H), flags=self.v3_interp,
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
         return Image.fromarray(img_np), M_total, aug_active, aug_flip, angle, centre, bpx
 
@@ -875,6 +904,13 @@ class SAM3DStudentDataset(Dataset):
         orig_h, orig_w = ann["orig_shape"]
 
         sq_bbox = ann["bbox_square"]
+        win = 0
+        if self.crop_windows:
+            # The tile is K windows side by side, each already at image_size;
+            # the chosen one's box replaces bbox_square everywhere below.
+            win = random.randrange(len(ann["win_boxes"])) if self.augment else 0
+            img_pil = img_pil.crop((win * W, 0, (win + 1) * W, H))
+            sq_bbox = ann["win_boxes"][win]
         sq_x1, sq_y1 = sq_bbox[0], sq_bbox[1]
         orig_crop_size = sq_bbox[2] - sq_bbox[0]
         true_scale = self.image_size / max(orig_crop_size, 1.0)
@@ -909,6 +945,14 @@ class SAM3DStudentDataset(Dataset):
         cy = (tight_bbox[1] + tight_bbox[3]) / 2.0
         b_size = max(tight_bbox[2] - tight_bbox[0], tight_bbox[3] - tight_bbox[1])
         b_scale = b_size / max(orig_w, orig_h)
+        if win:
+            # CLIFF describes the window: its centre, and the tight box that
+            # gives it at the standard 1.2x expansion -- what a detector box
+            # framing the person this way would produce at runtime.
+            cx = (sq_bbox[0] + sq_bbox[2]) / 2.0
+            cy = (sq_bbox[1] + sq_bbox[3]) / 2.0
+            b_size = (sq_bbox[2] - sq_bbox[0]) / 1.2
+            b_scale = b_size / max(orig_w, orig_h)
 
         aug_flip, cos_t, sin_t = 0.0, 1.0, 0.0
         M_total = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
@@ -1058,7 +1102,8 @@ def build_dataloaders(cfg):
                 jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
                 image_size=cfg.image_size,
                 context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
-                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift)
+                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
+                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows)
     full_dataset = SAM3DStudentDataset(
         cfg.data_root,
         augment=cfg.augment,
