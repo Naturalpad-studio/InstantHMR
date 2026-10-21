@@ -388,7 +388,9 @@ context crops (2.0x box, 448 px, `build_split.py --context`) that only
 `--preset v3` can read. Each root has its own pair index. The builder refuses a
 context build without `--output-dir`, and the v3 dataset refuses any root that
 contains a standard split. Generation 9 is the first to train on `data_ctx`; see
-STATUS.md. When `prepost` has no free node, `datasets_pipeline/jeanzay/21_build_gpu.slurm`
+STATUS.md. A third kind, `data_win224` / `data_win288` (`build_split.py
+--windows 4`, one tile of four windows per person), is the only corpus
+`--preset v4` reads, and the image size must match the folder. When `prepost` has no free node, `datasets_pipeline/jeanzay/21_build_gpu.slurm`
 builds on the 2 h GPU dev queue instead.
 
 **You cannot reach Jean Zay.** No SSH, no Slurm. Print commands for the user and

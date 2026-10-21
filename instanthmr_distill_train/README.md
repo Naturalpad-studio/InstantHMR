@@ -647,6 +647,39 @@ exactly; reprojection chain vs labels 2e-4 px; CLIFF vs the recovered window
 0.000 px; no read past an inside-photo stored edge; standard or mixed roots
 refused (also through `PairIndex`).
 
+## `--preset v4` — v3's framings, cut like the runtime crop (added 2026-10-21)
+
+**Why.** v3 models learned the texture of their own crop pipeline: a 448 px
+context crop, then a second warp. On the same 997 3DPW-val people, g9_b4_224
+(epoch 314) scores 49.3 mm J14 PA on crops cut straight from the frame (what
+`val3dpw` and the phone do) against 43.6 mm on crops built v3's way; g8h scores
+40.0 / 39.4, i.e. it does not care. Lanczos made it worse, not better.
+
+**What.** `build_split.py --windows 4 --window-sizes 224,288 --no-hands
+--output-dir .../data_win{size}/sam3d_gt_<split>` stores, per person, one tile
+of four windows side by side (K*S x S px), each cut from the full-resolution
+photo with one `INTER_LINEAR` resize. Window 0 is the 1.2x box with the
+runtime's own floor / ceil rounding; windows 1-3 are v3 framings (side
+log-uniform in 0.6-2.0x the tight box, centre shift up to +/-15% of the side,
+black only where the window leaves the photo). Boxes are in `win_boxes` and
+are seeded by the person's name, so both sizes and every resume agree.
+
+The dataset (`crop_windows`) draws one window per sample (window 0 when not
+augmenting), uses its box as `bbox_square`, and builds CLIFF from the window
+(its centre, side / 1.2) -- what a detector box framing the person that way
+gives at runtime. Then the ordinary baseline geometry (rotation, flip, mild
+zoom / shift) and v2's occlusion and JPEG, with `cliff_follows_aug` and
+`mask_oob_2d`. **Loss weights are the baseline ones** (no v2 item 3).
+`--image-size` must equal the corpus's window size; anything else is refused.
+
+Verified by `tools/verify_windows.py` on 64 AIC people: default and `--context`
+builds byte-identical to HEAD; every window pixel-equal to
+`InstantHMR._preprocess` for the matching detector box (PNG), CLIFF equal to
+1e-7, labels 6e-5 px; JPEG q95 tiles 37.6-38.6 dB (224) / 39.1-40.2 dB (288)
+against the runtime crop, i.e. JPEG loss only; reprojection chain 1.6e-4 px;
+baseline / v2 samples bit-identical with the flag off. Storage ~83 KB (224) +
+~121 KB (288) per person, ~0.9 TB for the 4.2 M-person corpus.
+
 ## `--image-size` — the network input side (added 2026-09-25)
 
 Default 224, i.e. unchanged. Must be a multiple of 32, because the decoder's

@@ -42,6 +42,13 @@ The input pipeline that samples each training crop from a context crop over a wi
 A stored training crop covering twice the person's tight box at high resolution, from which the network's input window is sampled.
 _Avoid_: big crop, raw crop, original (originals are the full source frames)
 
+**v4 preset**:
+v3's framings without v3's texture: each training crop is one of four precomputed windows, on the baseline loss weights.
+
+**Precomputed window**:
+A training crop cut from the full-resolution photo with a single resize, exactly as the runtime cuts its crop; window 0 frames the person like a perfect detector box, the others loose, off-centre or truncated.
+_Avoid_: tile (the tile is the file holding a person's four windows side by side)
+
 ### Evaluation
 
 **Published protocol**:
