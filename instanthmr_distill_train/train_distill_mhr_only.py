@@ -191,6 +191,10 @@ class DistillConfig:
     # operation as the runtime crop; one window is drawn per sample (window 0,
     # the standard 1.2x crop, when not augmenting).
     crop_windows: bool = False
+    # "random": one of the K windows per augmented sample (v4). "standard":
+    # always window 0, i.e. the runtime crop of a perfect detector box -- the
+    # baseline framing, read from a window corpus at any --image-size.
+    window_mode: str = "random"
     max_images: int | None = None   
     per_dataset_caps: dict = field(default_factory=lambda: {"sam3d_gt_harmony4d": 300_000})
     val_split: float = 0.1
@@ -630,9 +634,11 @@ class SAM3DStudentDataset(Dataset):
                  jpeg_p: float = 0.0, jpeg_quality: tuple = (30, 90),
                  context_crops: bool = False, v3_box_min: float = 0.6,
                  v3_box_max: float = 2.0, v3_shift: float = 0.15,
-                 v3_lanczos: bool = False, crop_windows: bool = False):
+                 v3_lanczos: bool = False, crop_windows: bool = False,
+                 window_mode: str = "random"):
         super().__init__()
         self.crop_windows = crop_windows
+        self.window_mode = window_mode
         self.v3_interp = cv2.INTER_LANCZOS4 if v3_lanczos else cv2.INTER_LINEAR
         self.image_size = image_size
         self.context_crops = context_crops
@@ -908,7 +914,8 @@ class SAM3DStudentDataset(Dataset):
         if self.crop_windows:
             # The tile is K windows side by side, each already at image_size;
             # the chosen one's box replaces bbox_square everywhere below.
-            win = random.randrange(len(ann["win_boxes"])) if self.augment else 0
+            win = (random.randrange(len(ann["win_boxes"]))
+                   if self.augment and self.window_mode == "random" else 0)
             img_pil = img_pil.crop((win * W, 0, (win + 1) * W, H))
             sq_bbox = ann["win_boxes"][win]
         sq_x1, sq_y1 = sq_bbox[0], sq_bbox[1]
@@ -1103,7 +1110,8 @@ def build_dataloaders(cfg):
                 image_size=cfg.image_size,
                 context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
                 v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
-                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows)
+                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows,
+                window_mode=cfg.window_mode)
     full_dataset = SAM3DStudentDataset(
         cfg.data_root,
         augment=cfg.augment,

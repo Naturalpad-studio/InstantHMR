@@ -45,6 +45,7 @@ import eval_3dpw as E                          # noqa: E402
 import train_distill_mhr_only as T             # noqa: E402
 import val3dpw                                 # noqa: E402
 from benchlib import emdb as D                 # noqa: E402
+from benchlib.detboxes import apply_detector_boxes  # noqa: E402
 from benchlib import joints as J               # noqa: E402
 from benchlib import metrics as M              # noqa: E402
 from eval_3dpw_ckpt import predict             # noqa: E402
@@ -60,10 +61,14 @@ def parse_args():
     p.add_argument("--emdb-root", required=True)
     p.add_argument("--stride", type=int, default=1)
     p.add_argument("--bbox", default="gt-joints",
-                   choices=["gt-joints", "annotated"],
+                   choices=["gt-joints", "annotated", "detector"],
                    help="gt-joints: projected GT joints padded by --bbox-scale, "
                         "this repo's 3DPW convention. annotated: EMDB's own "
-                        "boxes, the published 'Oracle' protocol.")
+                        "boxes, the published 'Oracle' protocol. detector: "
+                        "RF-DETR's box, as the deployed pipeline crops "
+                        "(benchlib/detboxes.py); missed detections are dropped.")
+    p.add_argument("--detector-variant", default="medium",
+                   help="RF-DETR variant for --bbox detector (the demo's default)")
     p.add_argument("--bbox-scale", type=float, default=1.2)
     p.add_argument("--gt-dir", default=None)
     p.add_argument("--adapter", default="benchmark/results/adapter_smpl24_teacher.npz",
@@ -195,9 +200,16 @@ def main():
                          "fit one with fit_adapter_mhr.py --target smpl24")
     W_adapt = ad["W"]
 
-    ds = EMDBValSet(args.emdb_root, stride=args.stride, bbox=args.bbox,
+    ds = EMDBValSet(args.emdb_root, stride=args.stride,
+                    bbox="gt-joints" if args.bbox == "detector" else args.bbox,
                     bbox_scale=args.bbox_scale, gt_dir=args.gt_dir,
                     cliff_focal=cliff_focal, input_size=input_size)
+    det_stats = None
+    if args.bbox == "detector":
+        det_stats = apply_detector_boxes(ds, "emdb1", args.detector_variant)
+        print(f"[detector] RF-DETR {args.detector_variant}: {det_stats['n_missed']} of "
+              f"{det_stats['n_frames']} frames missed ({100 * det_stats['miss_rate']:.2f}%), "
+              f"mean IoU with the GT person {det_stats['mean_iou']:.3f}")
     seqs = sorted({s["sequence"] for s in ds.samples})
     print(f"[EMDB1] {len(ds):,} frames across {len(seqs)} sequences "
           f"(stride {args.stride}, boxes: {args.bbox}), CLIFF conditioning "
@@ -237,13 +249,14 @@ def main():
 
         report[ck_path] = dict(
             ckpt=ck_path, dataset="EMDB1", split="emdb1", stride=args.stride,
-            bbox=args.bbox, adapter=str(args.adapter), landmarks=args.landmarks,
+            bbox=args.bbox, detector=det_stats,
+            adapter=str(args.adapter), landmarks=args.landmarks,
             epoch=ck.get("epoch"), source=ck.get("source"),
             n=int(pred.shape[0]), n_dropped=n_dropped,
             num_sequences=len(seqs), results=rows,
             per_sequence_SMPL24_adapter=per_seq)
 
-        run = Path(ck_path).parts[-3]
+        run = Path(ck_path).parent.name
         name = Path(ck_path).stem.replace("best_student_model_", "")
         print(f"  {run:<24s} {name:<6s} {str(ck.get('epoch')):>4s} "
               f"{head['PA_MPJPE_mm']:13.2f} {head['MPJPE_mm']:16.2f} "

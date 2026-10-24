@@ -398,7 +398,8 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 image_size=cfg.image_size,
                 context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
                 v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
-                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows)
+                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows,
+                window_mode=cfg.window_mode)
 
     # Rank 0 builds the index (or reads the cache) while the others wait, then
     # everyone loads the same cache. Building on all ranks at once would put
@@ -712,6 +713,7 @@ def train(args, cfg, rank, local_rank, world):
             "image_size": cfg.image_size, "context_crops": cfg.context_crops,
             "v3_box": [cfg.v3_box_min, cfg.v3_box_max], "v3_shift": cfg.v3_shift,
             "v3_lanczos": cfg.v3_lanczos, "crop_windows": cfg.crop_windows,
+            "window_mode": cfg.window_mode if cfg.crop_windows else None,
             "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
             "exact_landmarks": cfg.exact_landmarks,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
@@ -1180,6 +1182,14 @@ def parse_args():
                         "corpus at --image-size), v2's occlusion/JPEG, baseline "
                         "geometry and baseline loss weights. "
                         "'baseline' reproduces the pre-v2 trainer exactly.")
+    p.add_argument("--windows", choices=["standard", "random"], default=None,
+                   help="Read a window corpus (build_split.py --windows; --data_root "
+                        "data_win<size>) on top of any preset but v3. 'standard': "
+                        "always window 0, the runtime crop -- the baseline framing at "
+                        "any --image-size. 'random': one of the 4 windows per "
+                        "augmented sample (v4's framings: zoom-out, zoom-in, shift), "
+                        "with the box-follows-crop and off-crop-keypoint masking it "
+                        "needs. --preset v4 implies 'random'.")
     p.add_argument("--w_reproj", type=float, default=None)
     p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true",
                    help="Divide the CLIFF crop-centre correction by the zoom. "
@@ -1285,6 +1295,11 @@ def build_cfg(args):
         apply_v3_preset(cfg)
     if args.preset == "v4":
         apply_v4_preset(cfg)
+    if args.windows:
+        if cfg.context_crops:
+            raise SystemExit("--windows replaces the input corpus; --preset v3 reads "
+                             "context crops instead")
+        apply_windows(cfg, args.windows)
     # Orthogonal axis: --preset is the input pipeline + absolute-pose terms,
     # --losses is the loss budget. Applied second so it owns w_keypoints3d.
     if args.losses == "rebalanced":
@@ -1344,6 +1359,20 @@ def apply_v3_preset(cfg) -> None:
     # The window's CLIFF vector is built in the perspective-correct form; the
     # pixel form is ambiguous on this corpus's real focals. Mandatory, not a flag.
     cfg.cliff_focal = True
+
+
+def apply_windows(cfg, mode: str) -> None:
+    """Train on a window corpus. 'standard' changes only where the crop comes
+    from (window 0 = the runtime crop, one resize from the photo), so the
+    preset's augmentation is untouched. 'random' adds v4's framings, which
+    truncate and shift the person, so it also turns on the two prerequisites
+    v2 introduced for exactly that: CLIFF follows the crop, and keypoints
+    pushed off the crop are masked out of the 2D losses."""
+    cfg.crop_windows = True
+    cfg.window_mode = mode
+    if mode == "random":
+        cfg.cliff_follows_aug = True
+        cfg.mask_oob_2d = True
 
 
 def apply_v4_preset(cfg) -> None:

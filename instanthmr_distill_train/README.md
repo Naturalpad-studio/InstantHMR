@@ -680,6 +680,18 @@ against the runtime crop, i.e. JPEG loss only; reprojection chain 1.6e-4 px;
 baseline / v2 samples bit-identical with the flag off. Storage ~83 KB (224) +
 ~121 KB (288) per person, ~0.9 TB for the 4.2 M-person corpus.
 
+**`--windows {standard,random}` (added 2026-10-25)** reads the same window corpus
+under any preset but v3, so framing and photometrics can be varied apart.
+`standard` always takes window 0 (the runtime crop) and changes nothing else:
+that is the baseline preset at any `--image-size`, since `data/` exists only at
+224. `random` adds v4's framings plus their two prerequisites (`cliff_follows_aug`,
+`mask_oob_2d`). So `--preset baseline --windows random` is v4 without its
+occlusion and JPEG changes, and `--preset v4` is unchanged (it implies `random`).
+Verified in `tools/verify_windows.py` [8]-[9]: v4 samples are bit-identical to
+before. `standard` draws the same augmentation and CLIFF as baseline on `data/`,
+with labels within 1.1 px (window 0 uses the runtime's box rounding), and its
+reprojection chain closes to 1e-4 px at 288.
+
 ## `--image-size` — the network input side (added 2026-09-25)
 
 Default 224, i.e. unchanged. Must be a multiple of 32, because the decoder's

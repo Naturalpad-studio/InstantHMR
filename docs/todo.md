@@ -33,6 +33,32 @@ are hypotheses unless accompanied by a matched training ablation.
 
 ---
 
+# 0. Next run: a baseline-preset model family (agreed 2026-10-25)
+
+Train `--preset baseline` at B0 / B1 / B2 / B4, 288 px (B4-224 already exists:
+g8h_lr1x_e600), same options and 600-epoch schedule as g8h_lr1x_e600.
+
+**Why, measured 2026-10-24** (`benchmark/results/gen9w_*.json`, every frame, best
+checkpoints): with the deployed RF-DETR boxes, g8h B4-224 (baseline) beats every
+v4 model, including v4 B4-288. On 3DPW test (J14+adapter PA) it scores 41.02
+against 41.27; on EMDB-1 (SMPL24+adapter PA) 51.27 against 52.67. v4 wins only on
+EMDB's annotated boxes (54.22 vs 62.87), which are looser than any detector's.
+288 beats 224 at every v4 size by 0.7-2.6 mm on 3DPW and 1.8-3.9 mm on EMDB
+(RF-DETR boxes), for +1.8-6 ms on desktop CPU.
+
+**Plan (2026-10-25), 288 only:** two arms per backbone, both with baseline losses
+and the baseline occlusion, no JPEG, on `data_win288`
+(`datasets_pipeline/jeanzay/28_dev_driver_g10.sh`):
+
+- `g10b_*`: `--preset baseline --windows standard`, i.e. the baseline framing.
+- `g10f_*`: `--preset baseline --windows random`, i.e. v4's framings.
+
+This also separates v4's two changes: g10f vs g9w isolates occlusion + JPEG, and
+g10b vs g10f isolates the framings. Judge on RF-DETR boxes and on the published
+protocols. Delete this item when the table is in `benchmark/results/`.
+
+---
+
 # 1. Reproduce the teacher's regression pathway exactly
 
 **Status: implemented 2026-09-12, launched as generation 8.** Behind

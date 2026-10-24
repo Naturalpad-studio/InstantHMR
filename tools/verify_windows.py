@@ -310,6 +310,72 @@ def main() -> None:  # noqa: C901
         except ValueError as e:
             check(want in str(e), f"refused: {str(e)[:90]}")
 
+    print("[8] window_mode: v4 unchanged, 'standard' = the baseline framing")
+    cfg = cfg_for("v4")
+    new, old = dataset(T, wd[224].parent, cfg), dataset(R, wd[224].parent, cfg)
+    diff = sum(not all(same(a[x], b[x]) for x in a)
+               for t in range(24) for _ in range(2)
+               for a, b in [(seeded(new, t, 7 + t), seeded(old, t, 7 + t))])
+    check(diff == 0, f"v4 (window_mode random): {diff} of 48 samples differ from --ref")
+    # Same seeds, baseline augmentation: on the standard corpus vs window 0 of
+    # the window corpus. The standard draw consumes no randomness, so every
+    # augmentation must match; only the crop box differs (int() vs the runtime's
+    # floor / ceil rounding, <= 1 px), so the labels may move by about that.
+    base = cfg_for("baseline")
+    a_ds = dataset(T, std.parent, base)
+    b_ds = dataset(T, wd[224].parent, base, crop_windows=True, window_mode="standard")
+    names_a = [Path(p[1]).stem for p in a_ds.pairs]
+    cl = lab = 0.0
+    same_aug = box0 = True
+    for t in range(48):
+        i = t % len(b_ds)
+        j = names_a.index(Path(b_ds.pairs[i][1]).stem)
+        a, b = seeded(a_ds, j, 300 + t), seeded(b_ds, i, 300 + t)
+        win0 = load(wd[224], Path(b_ds.pairs[i][1]).stem)["win_boxes"][0]
+        box0 &= np.array_equal(np.asarray(b["bbox_square"]), win0)
+        same_aug &= all(torch.equal(a[k], b[k]) for k in ("aug_active", "aug_flip", "aug_cos", "aug_sin"))
+        cl = max(cl, float((a["cliff_cond"] - b["cliff_cond"]).abs().max()))
+        lab = max(lab, float((a["joints_2d"] - b["joints_2d"]).abs().max()) * 112)
+    check(box0, "standard: every augmented sample uses window 0")
+    check(same_aug and cl < 1e-6, f"standard: same augmentation draws and CLIFF as baseline "
+                                  f"on the standard corpus (CLIFF max diff {cl:.1e})")
+    check(lab < 3.0, f"standard: labels within {lab:.2f} px of baseline's (box rounding only)")
+    ds = dataset(T, wd[288].parent, cfg_for("baseline", 288), crop_windows=True,
+                 window_mode="standard", geom_p=1.0)
+    rep = 0.0
+    for t in range(100):
+        smp = seeded(ds, t % len(ds), 900 + t)
+        vis = smp["joints_2d_vis"].numpy() > 0
+        rep = max(rep, float((np.abs(reproject(smp, 288) - smp["joints_2d"].numpy())[vis]
+                              * 144).max()))
+    check(rep < 1e-3, f"standard at 288: reprojection chain max {rep:.2e} px")
+
+    print("[9] --windows on the trainer's command line")
+    def cfg_cli(*flags):
+        old_argv = sys.argv
+        sys.argv = ["train_distill_jz.py", "--cliff-focal", *flags]
+        try:
+            return JZ.build_cfg(JZ.parse_args())
+        finally:
+            sys.argv = old_argv
+    c = cfg_cli("--preset", "baseline", "--windows", "standard")
+    check(c.crop_windows and c.window_mode == "standard" and not c.cliff_follows_aug
+          and not c.mask_oob_2d and c.occl_p == 0.2 and c.jpeg_p == 0.0 and c.w_reproj == 0.01,
+          "baseline + --windows standard: window 0, baseline augmentation and losses")
+    c = cfg_cli("--preset", "baseline", "--windows", "random")
+    check(c.crop_windows and c.window_mode == "random" and c.cliff_follows_aug
+          and c.mask_oob_2d and c.occl_p == 0.2 and c.occl_scale == (0.02, 0.15)
+          and c.jpeg_p == 0.0 and c.w_reproj == 0.01,
+          "baseline + --windows random: v4 framings, baseline occlusion, no JPEG")
+    c4 = cfg_cli("--preset", "v4")
+    check(c4.window_mode == "random" and c4.occl_p == 0.7 and c4.jpeg_p == 0.3,
+          "--preset v4 unchanged")
+    try:
+        cfg_cli("--preset", "v3", "--windows", "standard")
+        check(False, "--preset v3 --windows accepted")
+    except SystemExit as e:
+        check("v3" in str(e), "--preset v3 --windows refused")
+
     if fails:
         print(f"FAIL ({len(fails)})")
         sys.exit(1)

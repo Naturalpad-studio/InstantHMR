@@ -34,6 +34,7 @@ import eval_3dpw as E                          # noqa: E402
 import train_distill_mhr_only as T             # noqa: E402
 import val3dpw                                 # noqa: E402
 from benchlib import joints as J               # noqa: E402
+from benchlib.detboxes import apply_detector_boxes  # noqa: E402
 
 MM = 1000.0
 
@@ -46,6 +47,13 @@ def parse_args():
     p.add_argument("--image-root", required=True)
     p.add_argument("--split", default="test")
     p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--bbox", default="gt-joints", choices=["gt-joints", "detector"],
+                   help="gt-joints: projected GT joints padded 1.2x, the published "
+                        "protocol. detector: RF-DETR's box matched to each GT "
+                        "person, as the deployed pipeline crops "
+                        "(benchlib/detboxes.py); missed detections are dropped.")
+    p.add_argument("--detector-variant", default="medium",
+                   help="RF-DETR variant for --bbox detector (the demo's default)")
     p.add_argument("--gt", nargs="+", default=["h36m"],
                    choices=["h36m", "jointpositions"])
     p.add_argument("--gt-dir", default=None)
@@ -163,13 +171,20 @@ def main():
 
     # One dataset per GT source: same samples and same crops, different joint
     # values, so a single forward pass scores against all of them.
-    sets = {}
+    sets, det_stats = {}, None
     for gt in args.gt:
         ds = val3dpw.ThreeDPWValSet(args.sequence_dir, args.image_root,
                                     split=args.split, stride=args.stride,
                                     gt=gt, gt_dir=args.gt_dir,
                                     cliff_focal=cliff_focal,
                                     input_size=input_size)
+        if args.bbox == "detector":
+            det_stats = apply_detector_boxes(ds, f"3dpw_{args.split}",
+                                             args.detector_variant)
+            print(f"[detector] RF-DETR {args.detector_variant}: {det_stats['n_missed']} of "
+                  f"{det_stats['n_frames']} person-frames missed "
+                  f"({100 * det_stats['miss_rate']:.2f}%), mean IoU with the GT "
+                  f"person {det_stats['mean_iou']:.3f}")
         sets[gt] = ds
         print(f"[3DPW] {args.split} / GT={gt}: {len(ds):,} person-frames "
               f"(stride {args.stride}), CLIFF conditioning "
@@ -207,12 +222,13 @@ def main():
                 rows["J14+adapter"] = E.evaluate_adapter(pred, gt_arr, W_adapt, gt)
             report[f"{ck_path}|{gt}"] = dict(
                 ckpt=ck_path, gt=gt, split=args.split, stride=args.stride,
+                bbox=args.bbox, detector=det_stats,
                 epoch=ck.get("epoch"), source=ck.get("source"),
                 landmarks=args.landmarks,
                 n=int(pred.shape[0]), n_dropped=n_dropped,
                 results=list(rows.values()))
 
-            run = Path(ck_path).parts[-3]
+            run = Path(ck_path).parent.name
             name = Path(ck_path).stem.replace("best_student_model_", "")
             line = (f"  {run:<24s} {name:<6s} {str(ck.get('epoch')):>4s} {gt:<15s} "
                     f"{rows['J12']['PA_MPJPE_mm']:8.2f} {rows['J12']['MPJPE_mm']:10.2f} "
