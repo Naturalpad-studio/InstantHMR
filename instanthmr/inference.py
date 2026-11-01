@@ -106,6 +106,15 @@ class HMRPrediction:
     image_shape: tuple[int, int]
     mhr_params: np.ndarray
     shape_params: np.ndarray
+    contact_prob: Optional[np.ndarray] = None   # (2,) [left, right] foot, prev-token graphs only
+
+    def prev_pose(self) -> np.ndarray:
+        """This prediction encoded as a prev-token graph's ``prev_pose`` input:
+        the 70 rig-local keypoints, then ``cam_trans`` as (x/z, y/z, log z)."""
+        t = self.cam_trans
+        z = max(float(t[2]), 0.1)
+        return np.concatenate([self.joints_3d_local.reshape(-1),
+                               [t[0] / z, t[1] / z, math.log(z)]]).astype(np.float32)
 
 
 class InstantHMR:
@@ -183,7 +192,12 @@ class InstantHMR:
         # Output order from export: mhr_params, shape_params, cam_trans,
         # joints_2d[, joints_3d]. The MHR-only student stops after joints_2d.
         self._out_names = out_names
-        self.has_joints_3d_head = "joints_3d" in out_names or len(out_names) >= 5
+        # A --prev-token graph (tools/pth_to_onnx.py) also takes prev_pose and
+        # has_prev, and returns contact_logits instead of a joints_3d head.
+        self.has_prev_input = "prev_pose" in in_names
+        self._prev_dim = self.session.get_inputs()[2].shape[1] if self.has_prev_input else 0
+        self.has_joints_3d_head = "joints_3d" in out_names or (
+            len(out_names) >= 5 and "contact_logits" not in out_names)
         self._mhr = mhr
 
         # Two independent things, and conflating them is what made this wrong:
@@ -220,6 +234,27 @@ class InstantHMR:
             return float(f)
         diag = math.sqrt(h * h + w * w)
         return (FOCAL_FALLBACK_DIAG * diag) if self.cliff_focal else diag
+
+    def _feeds(self, crops: np.ndarray, cliffs: np.ndarray,
+               prev: Optional[list] = None) -> dict:
+        """Session inputs; for a prev-token graph, ``prev[i]`` is person i's
+        ``HMRPrediction.prev_pose()`` from an earlier frame, or None = withheld."""
+        feeds = {self._in_image: crops, self._in_cliff: cliffs}
+        if self.has_prev_input:
+            n = crops.shape[0]
+            pp = np.zeros((n, self._prev_dim), dtype=np.float32)
+            hp = np.zeros((n,), dtype=np.float32)
+            for i, v in enumerate((prev or [])[:n]):
+                if v is not None:
+                    pp[i], hp[i] = v, 1.0
+            feeds["prev_pose"], feeds["has_prev"] = pp, hp
+        return feeds
+
+    def _contact(self, outs: list, i: int) -> Optional[np.ndarray]:
+        if "contact_logits" not in self._out_names:
+            return None
+        z = outs[self._out_names.index("contact_logits")][i].astype(np.float32)
+        return 1.0 / (1.0 + np.exp(-z))
 
     @property
     def derives_joints_3d(self) -> bool:
@@ -262,6 +297,7 @@ class InstantHMR:
         bbox: np.ndarray | list[float],
         confidence: float = 1.0,
         focal: float | None = None,
+        prev: Optional[np.ndarray] = None,
     ) -> HMRPrediction:
         """Run InstantHMR on a single person.
 
@@ -272,6 +308,8 @@ class InstantHMR:
             focal: this frame's focal length in pixels, overriding the one
                 given to the constructor. Use it when the focal varies per
                 image, as it does across calibrated benchmark sequences.
+            prev: prev-token graphs only, this person's earlier
+                ``HMRPrediction.prev_pose()``; None withholds it.
 
         Returns:
             ``HMRPrediction`` with joints in full-frame coordinates.
@@ -286,10 +324,8 @@ class InstantHMR:
 
         outs = self.session.run(
             None,
-            {
-                self._in_image: crop[np.newaxis],         # (1, 3, S, S), S = self.input_size
-                self._in_cliff: cliff_cond[np.newaxis],   # (1, 3)
-            },
+            # (1, 3, S, S) with S = self.input_size, and (1, 3)
+            self._feeds(crop[np.newaxis], cliff_cond[np.newaxis], [prev]),
         )
         # Order: mhr_params, shape_params, cam_trans, joints_2d[, joints_3d]
         mhr_params = outs[0][0].astype(np.float32)
@@ -329,6 +365,7 @@ class InstantHMR:
             image_shape=(h, w),
             mhr_params=mhr_params,
             shape_params=shape_params,
+            contact_prob=self._contact(outs, 0),
         )
 
     def predict_batch(
@@ -337,6 +374,7 @@ class InstantHMR:
         detections: list[dict],
         padded_to: int | None = None,
         focal: float | None = None,
+        prev: Optional[list] = None,
     ) -> list[HMRPrediction]:
         """Run InstantHMR on multiple persons in a single ONNX call.
 
@@ -349,6 +387,8 @@ class InstantHMR:
                 person count changes.
             focal: this frame's focal length in pixels, overriding the one
                 given to the constructor.
+            prev: prev-token graphs only, one earlier
+                ``HMRPrediction.prev_pose()`` (or None) per detection.
 
         Returns:
             One ``HMRPrediction`` per input detection, in the same order.
@@ -374,10 +414,7 @@ class InstantHMR:
             cliffs[i] = cliff
             sq_meta.append((sq_x1, sq_y1, sq_size, bbox_arr))
 
-        outs = self.session.run(
-            None,
-            {self._in_image: crops, self._in_cliff: cliffs},
-        )
+        outs = self.session.run(None, self._feeds(crops, cliffs, prev))
         mhr_params_b = outs[0].astype(np.float32, copy=False)
         shape_params_b = outs[1].astype(np.float32, copy=False)
         cam_trans_b = outs[2].astype(np.float32, copy=False)
@@ -419,6 +456,7 @@ class InstantHMR:
                 image_shape=(h, w),
                 mhr_params=mhr_params_b[i],
                 shape_params=shape_params_b[i],
+                contact_prob=self._contact(outs, i),
             ))
         return results
 
@@ -435,14 +473,9 @@ class InstantHMR:
         )
         dummy_cliff = np.zeros((max_batch_size, 3), dtype=np.float32)
         # Large batch first — allocates the most memory; batch=1 reuses the plan.
-        self.session.run(
-            None, {self._in_image: dummy_image, self._in_cliff: dummy_cliff}
-        )
+        self.session.run(None, self._feeds(dummy_image, dummy_cliff))
         if max_batch_size > 1:
-            self.session.run(
-                None,
-                {self._in_image: dummy_image[:1], self._in_cliff: dummy_cliff[:1]},
-            )
+            self.session.run(None, self._feeds(dummy_image[:1], dummy_cliff[:1]))
 
     # ------------------------------------------------------------------
     # Preprocessing

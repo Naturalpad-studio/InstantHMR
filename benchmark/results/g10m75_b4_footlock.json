@@ -1,0 +1,12 @@
+{
+ "ckpt": "instanthmr_distill_train/runs/g10m75_b4_288_s0/best_student_model_v3.pth",
+ "trials": 48,
+ "single": {
+  "slide_mm": 27.666296599509735,
+  "slide_median_mm": 19.639506924676837,
+  "mocap_slide_mm": 1.799128054429777,
+  "foot_err_mm": 56.66949423833437,
+  "contact_f1": null,
+  "n_contact_pairs": 50999
+ }
+}

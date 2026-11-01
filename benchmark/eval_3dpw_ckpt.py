@@ -35,6 +35,7 @@ import train_distill_mhr_only as T             # noqa: E402
 import val3dpw                                 # noqa: E402
 from benchlib import joints as J               # noqa: E402
 from benchlib.detboxes import apply_detector_boxes  # noqa: E402
+from benchlib import feedback as FB            # noqa: E402
 
 MM = 1000.0
 
@@ -81,6 +82,14 @@ def parse_args():
                         "read from run_config.json")
     p.add_argument("--no-cliff-focal", dest="cliff_focal", action="store_false",
                    help="force the pixel-normalised CLIFF conditioning")
+    p.add_argument("--prev", default="masked", choices=["masked", "feedback"],
+                   help="--prev-token checkpoints only. masked (default): the "
+                        "previous pose withheld, the single-frame model. "
+                        "feedback: the model's own prediction --prev-lag frames "
+                        "earlier in the same track (benchlib/feedback.py).")
+    p.add_argument("--prev-lag", type=int, default=5,
+                   help="frames between a prediction and the one it feeds "
+                        "(5 = 167 ms at 30 fps, inside the training pairs)")
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=6)
     p.add_argument("--device", default="cuda")
@@ -208,8 +217,15 @@ def main():
         # Strict: an unexpected key means the config restored above is wrong
         # and the model being scored is not the model that was trained.
         model.load_state_dict(ck["model_state_dict"])
-        pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp,
-                                       exact_landmarks=exact_lm)
+        fb = args.prev == "feedback" and cfgs[ck_path].prev_token
+        if fb:
+            pred, idx, n_dropped = FB.predict_feedback(
+                model, first, mhr, device, lag=args.prev_lag, use_amp=cfg.use_amp,
+                exact_landmarks=exact_lm, batch_size=args.batch_size,
+                num_workers=args.num_workers)
+        else:
+            pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp,
+                                           exact_landmarks=exact_lm)
         del model
         torch.cuda.empty_cache()
 
@@ -218,13 +234,19 @@ def main():
             rows = {s: E.evaluate(pred, gt_arr, s, gt) for s in ("J14", "J12")}
             # An adapter absorbs the offset between the MHR rig and one specific
             # GT convention, so scoring it against the other one is meaningless.
+            jit = None
             if W_adapt is not None and W_adapt_gt == gt:
                 rows["J14+adapter"] = E.evaluate_adapter(pred, gt_arr, W_adapt, gt)
+                pj = np.einsum("jk,nkc->njc", W_adapt, pred - pred.mean(axis=1, keepdims=True))
+                gj = gt_arr[:, J.gt_index(J.JOINT_SETS["J14"], gt), :]
+                jit = FB.accel(pj, gj, J.pelvis(pj), J.pelvis(gj), [ds.samples[i] for i in idx])
             report[f"{ck_path}|{gt}"] = dict(
                 ckpt=ck_path, gt=gt, split=args.split, stride=args.stride,
                 bbox=args.bbox, detector=det_stats,
                 epoch=ck.get("epoch"), source=ck.get("source"),
                 landmarks=args.landmarks,
+                prev="feedback" if fb else "masked",
+                prev_lag=args.prev_lag if fb else None, accel_J14_adapter=jit,
                 n=int(pred.shape[0]), n_dropped=n_dropped,
                 results=list(rows.values()))
 
@@ -243,6 +265,9 @@ def main():
                          f" {rows['J14+adapter']['MPJPE_mm']:13.2f}"
                          if "J14+adapter" in rows
                          else f" {'n/a':>10s} {'n/a':>13s}")
+            if jit and jit["n_triplets"]:
+                line += f"  accel {jit['accel_mm']:.2f} err {jit['accel_err_mm']:.2f} mm/f^2"
+            line += "  [feedback]" if fb else ""
             print(line + (f"   ({n_dropped} dropped)" if n_dropped else ""), flush=True)
 
             if args.fit_adapter:

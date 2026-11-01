@@ -17,6 +17,9 @@ Logs, per frame:
   - ``timing/render_ms``    : scalar plot of MHR mesh rendering latency.
   - ``timing/total_ms``     : scalar plot of full pipeline latency.
   - ``timing/fps``          : scalar plot of effective frames-per-second.
+  - ``contact/person_N/{left,right}``: per-foot contact probability, and the
+                              feet drawn red while planted (> 0.5), for a
+                              prev-token graph that has a contact head.
 
 ``rr.init(..., spawn=True)`` is called automatically so the viewer opens
 on construction (pass ``spawn_viewer=False`` to suppress).
@@ -48,6 +51,13 @@ MESH_ALPHA = 0.35
 REF_MESH_COLOR = (110, 170, 255)
 REF_JOINT_COLOR = (0, 200, 255)
 REF_SKELETON_COLOR = (255, 110, 255)
+
+#: MHR70 keypoints of each foot (ankle, big toe, small toe, heel), in the
+#: [left, right] order of ``HMRPrediction.contact_prob``.
+FOOT_KP = ((13, 15, 16, 17), (14, 18, 19, 20))
+FOOT_NAMES = ("left", "right")
+PLANTED_COLOR = (255, 40, 40)
+FREE_COLOR = (230, 230, 230)
 
 
 class RerunVisualizer:
@@ -245,6 +255,14 @@ class RerunVisualizer:
                 rr.LineStrips3D(lines, colors=[255, 230, 0], radii=0.004),
             )
 
+        if person.contact_prob is not None:
+            for name, kp, prob in zip(FOOT_NAMES, FOOT_KP, person.contact_prob):
+                planted = prob > 0.5
+                rr.log(f"{path}/feet/{name}", rr.Points3D(
+                    positions=joints[list(kp)], radii=0.03 if planted else 0.015,
+                    colors=[PLANTED_COLOR if planted else FREE_COLOR]))
+                rr.log(f"contact/person_{idx}/{name}", rr.Scalars(float(prob)))
+
     def _log_reference(self, frame_idx: int) -> None:
         """Log the saved teacher prediction for this frame under ``world/reference``.
 
@@ -357,6 +375,22 @@ class RerunVisualizer:
                 if valid[k]:
                     cv2.circle(out, (int(x), int(y)), 3, (0, 230, 0), -1)
 
+            if person.contact_prob is not None:
+                r = max(4, int(round(0.012 * max(h, w))))
+                for name, kp, prob in zip(FOOT_NAMES, FOOT_KP, person.contact_prob):
+                    planted = prob > 0.5
+                    for k in kp:
+                        if valid[k]:
+                            cv2.circle(out, tuple(j2d[k].astype(int)), r,
+                                       PLANTED_COLOR if planted else FREE_COLOR,
+                                       -1 if planted else 2)
+                    k = kp[0]
+                    if valid[k]:
+                        cv2.putText(out, f"{name[0].upper()} {prob:.2f}",
+                                    (int(j2d[k, 0]) + r + 2, int(j2d[k, 1]) - r),
+                                    cv2.FONT_HERSHEY_SIMPLEX, max(0.5, r / 12),
+                                    PLANTED_COLOR if planted else FREE_COLOR, 2, cv2.LINE_AA)
+
         # ---- Timing HUD (top-left, semi-transparent black panel) ----
         lines: list[str] = []
         if detector_ms is not None:
@@ -394,7 +428,7 @@ class RerunVisualizer:
         return out
 
     def _send_blueprint(self, first: HMRPrediction) -> None:
-        """Send a 3-panel blueprint: camera image | 3D scene | timings."""
+        """Send the blueprint: camera image | 3D scene | timings (+ contact)."""
         import rerun.blueprint as rrb
         rr = self._rr
 
@@ -409,15 +443,16 @@ class RerunVisualizer:
             float(center[2] - cam_distance),
         ]
 
+        plots = [rrb.TimeSeriesView(origin="timing", name="Latency (ms)")]
+        if first.contact_prob is not None:
+            plots.append(rrb.TimeSeriesView(origin="contact",
+                                            name="Foot contact probability"))
         blueprint = rrb.Blueprint(
             rrb.Horizontal(
                 rrb.Vertical(
                     rrb.Spatial2DView(origin="camera/image", name="Camera"),
-                    rrb.TimeSeriesView(
-                        origin="timing",
-                        name="Latency (ms)",
-                    ),
-                    row_shares=[3, 1],
+                    *plots,
+                    row_shares=[3] + [1] * len(plots),
                 ),
                 rrb.Spatial3DView(
                     origin="/",

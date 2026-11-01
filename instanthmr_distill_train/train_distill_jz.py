@@ -399,7 +399,8 @@ def build_jz_loaders(cfg, args, rank: int, world: int):
                 context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
                 v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
                 v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows,
-                window_mode=cfg.window_mode)
+                window_mode=cfg.window_mode, window0_p=cfg.window0_p,
+                temporal=T.temporal_kwargs(cfg))
 
     # Rank 0 builds the index (or reads the cache) while the others wait, then
     # everyone loads the same cache. Building on all ranks at once would put
@@ -606,6 +607,17 @@ def train(args, cfg, rank, local_rank, world):
                 f"never used for checkpoint selection")
 
     model = T.InstantHMRStudent(cfg, pretrained=not args.no_pretrained).to(device)
+    if args.init_from and not ((out_dir / "last.pth").exists() and not args.no_resume):
+        # Before the EMA copy below, so the EMA starts from these weights too.
+        ck = torch.load(args.init_from, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["model_state_dict"], strict=False)
+        new = ("prev_proj.", "prev_query", "prev_mask_embed", "contact_head.")
+        bad = [k for k in missing if not k.startswith(new)] + list(unexpected)
+        if bad:
+            raise SystemExit(f"--init-from {args.init_from}: keys do not match the "
+                             f"model built from these flags: {bad[:8]}")
+        log(f"🧩 initialised from {args.init_from} (epoch {ck.get('epoch')}); "
+            f"{len(missing)} new parameter tensors keep their init")
     if args.sync_bn and world > 1:
         # repvit is 218 BatchNorm2d layers. At batch 64 per GPU the local stats
         # are already reliable, so this is off by default — it costs an all-
@@ -714,6 +726,7 @@ def train(args, cfg, rank, local_rank, world):
             "v3_box": [cfg.v3_box_min, cfg.v3_box_max], "v3_shift": cfg.v3_shift,
             "v3_lanczos": cfg.v3_lanczos, "crop_windows": cfg.crop_windows,
             "window_mode": cfg.window_mode if cfg.crop_windows else None,
+            "window0_p": cfg.window0_p,
             "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
             "exact_landmarks": cfg.exact_landmarks,
             "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
@@ -730,6 +743,11 @@ def train(args, cfg, rank, local_rank, world):
             "bound_scales": cfg.bound_scales,
             "scale_bound_margin": cfg.scale_bound_margin,
             "anomaly_safe_fallback": cfg.anomaly_safe_fallback,
+            "init_from": args.init_from,
+            "prev_token": cfg.prev_token, "contact_head": cfg.contact_head,
+            "prev_mask_p": cfg.prev_mask_p, "prev_pairs_only": cfg.prev_pairs_only,
+            "w_contact": cfg.w_contact,
+            "w_zero_vel": cfg.w_zero_vel, "w_foot_mocap": cfg.w_foot_mocap,
             "started": time.strftime("%Y-%m-%d %H:%M")})
 
     ema_rollbacks = 0
@@ -754,7 +772,8 @@ def train(args, cfg, rank, local_rank, world):
                      for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=cfg.use_amp):
-                preds = ddp_model(batch["image"], batch["cliff_cond"])
+                preds = ddp_model(batch["image"], batch["cliff_cond"],
+                                  batch.get("prev_pose"), batch.get("has_prev"))
             preds = {k: v.float() for k, v in preds.items()}
             losses = criterion(preds, batch)
             loss = losses["total_loss"]
@@ -1161,6 +1180,13 @@ def parse_args():
 
     p.add_argument("--sync-bn", action="store_true")
     p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--init-from", dest="init_from", default=None,
+                   help="Start a NEW run from this checkpoint's weights (a "
+                        "best_student_model_v3.pth or last.pth), keeping the fresh "
+                        "optimiser and schedule. Parameters the checkpoint lacks "
+                        "(--prev-token, --contact-head) keep their initialisation; "
+                        "any other missing or mismatched key raises. Ignored when "
+                        "the run resumes from its own last.pth.")
     p.add_argument("--extend", action="store_true",
                    help="Continue a run past the epoch count it was trained "
                         "with: rebuild the LR schedule over the new total and "
@@ -1190,6 +1216,10 @@ def parse_args():
                         "augmented sample (v4's framings: zoom-out, zoom-in, shift), "
                         "with the box-follows-crop and off-crop-keypoint masking it "
                         "needs. --preset v4 implies 'random'.")
+    p.add_argument("--window0-p", dest="window0_p", type=float, default=None,
+                   help="With --windows random (or --preset v4): probability of the "
+                        "standard crop (window 0); the other windows share the rest. "
+                        "Default: all 4 equally likely, i.e. 0.25.")
     p.add_argument("--w_reproj", type=float, default=None)
     p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true",
                    help="Divide the CLIFF crop-centre correction by the zoom. "
@@ -1197,6 +1227,19 @@ def parse_args():
                         "it the box centre the network is told is off by 7.73 px "
                         "mean / 21.0 px p95 at v2 zoom strength. Default "
                         "off so generation 5 reproduces bit-for-bit.")
+    p.add_argument("--prev-token", dest="prev_token", action="store_true",
+                   help="Foot lock: an extra decoder query carrying the previous "
+                        "frame's 70 keypoints + cam_trans (withheld with "
+                        "--prev-mask-p), real pairs on Harmony4D / semelle, GT + "
+                        "noise elsewhere. Also turns on the per-foot contact head.")
+    p.add_argument("--prev-mask-p", dest="prev_mask_p", type=float, default=None)
+    p.add_argument("--prev-pairs-only", dest="prev_pairs_only", action="store_true",
+                   help="With --prev-token: withhold the previous pose on stills "
+                        "instead of feeding their own GT + noise, so it only ever "
+                        "comes from a real earlier frame (Harmony4D / semelle).")
+    p.add_argument("--w-contact", dest="w_contact", type=float, default=None)
+    p.add_argument("--w-zero-vel", dest="w_zero_vel", type=float, default=None)
+    p.add_argument("--w-foot-mocap", dest="w_foot_mocap", type=float, default=None)
     p.add_argument("--w-verts", dest="w_verts", type=float, default=None,
                    help="Weight on the surface (PVE) term: unsquared Euclidean "
                         "distance, in metres, between predicted and teacher mesh "
@@ -1279,6 +1322,20 @@ def build_cfg(args):
     if args.early_stop_patience is not None:
         cfg.early_stop_patience = args.early_stop_patience
     if args.w_verts is not None:    cfg.w_verts = args.w_verts
+    if args.prev_token:
+        cfg.prev_token = cfg.contact_head = True
+        # The two Euclidean terms on loss_3d_native's 0.35 scale (rebalanced),
+        # so a foot keypoint is not pulled ~200x harder than the other 62.
+        cfg.w_contact, cfg.w_zero_vel = 0.3, 0.35
+    if args.prev_pairs_only:
+        if not args.prev_token:
+            raise SystemExit("--prev-pairs-only needs --prev-token")
+        cfg.prev_pairs_only = True
+    for k in ("prev_mask_p", "w_contact", "w_zero_vel", "w_foot_mocap"):
+        if getattr(args, k) is not None:
+            if not args.prev_token:
+                raise SystemExit(f"--{k.replace('_', '-')} needs --prev-token")
+            setattr(cfg, k, getattr(args, k))
     if args.n_verts is not None:    cfg.n_verts = args.n_verts
     if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
     if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
@@ -1300,6 +1357,12 @@ def build_cfg(args):
             raise SystemExit("--windows replaces the input corpus; --preset v3 reads "
                              "context crops instead")
         apply_windows(cfg, args.windows)
+    if args.window0_p is not None:
+        if not (cfg.crop_windows and cfg.window_mode == "random"):
+            raise SystemExit("--window0-p needs --windows random or --preset v4")
+        if not 0.0 <= args.window0_p <= 1.0:
+            raise SystemExit("--window0-p must be in [0, 1]")
+        cfg.window0_p = args.window0_p
     # Orthogonal axis: --preset is the input pipeline + absolute-pose terms,
     # --losses is the loss budget. Applied second so it owns w_keypoints3d.
     if args.losses == "rebalanced":

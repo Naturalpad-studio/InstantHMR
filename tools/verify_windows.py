@@ -376,6 +376,33 @@ def main() -> None:  # noqa: C901
     except SystemExit as e:
         check("v3" in str(e), "--preset v3 --windows refused")
 
+    print("[10] --window0-p: how often the standard crop is drawn")
+    rcfg = cfg_for("baseline")
+    for p0 in (0.5, 0.75):
+        ds = dataset(T, wd[224].parent, rcfg, crop_windows=True, window0_p=p0)
+        counts = np.zeros(K, int)
+        for t in range(2000):
+            random.seed(5000 + t)
+            i = t % len(ds)
+            box = np.asarray(ds[i]["bbox_square"])
+            wb = load(wd[224], Path(ds.pairs[i][1]).stem)["win_boxes"]
+            counts[int(np.argmax([np.array_equal(box, w) for w in wb]))] += 1
+        f = counts / counts.sum()
+        rest = (1 - p0) / (K - 1)
+        check(abs(f[0] - p0) < 0.04 and np.all(np.abs(f[1:] - rest) < 0.04),
+              f"p0={p0}: window frequencies {np.round(f, 3).tolist()} "
+              f"(expect {p0} then {rest:.3f} each)")
+    c = cfg_cli("--preset", "baseline", "--windows", "random", "--window0-p", "0.5")
+    check(c.window0_p == 0.5 and c.window_mode == "random", "--window0-p 0.5 reaches the config")
+    for bad in (("--preset", "baseline", "--windows", "standard", "--window0-p", "0.5"),
+                ("--preset", "baseline", "--window0-p", "0.5"),
+                ("--preset", "baseline", "--windows", "random", "--window0-p", "1.5")):
+        try:
+            cfg_cli(*bad)
+            check(False, f"accepted: {' '.join(bad)}")
+        except SystemExit:
+            check(True, f"refused: {' '.join(bad[2:])}")
+
     if fails:
         print(f"FAIL ({len(fails)})")
         sys.exit(1)

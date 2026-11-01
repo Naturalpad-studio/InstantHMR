@@ -1,0 +1,175 @@
+{
+  "models/instanthmr.pth": {
+    "ckpt": "models/instanthmr.pth",
+    "dataset": "EMDB1",
+    "split": "emdb1",
+    "stride": 1,
+    "bbox": "gt-joints",
+    "detector": null,
+    "adapter": "benchmark/results/adapter_smpl24_teacher.npz",
+    "landmarks": "fitted",
+    "epoch": 297,
+    "source": null,
+    "n": 24103,
+    "n_dropped": 0,
+    "num_sequences": 17,
+    "results": [
+      {
+        "joint_set": "SMPL24+adapter",
+        "num_joints": 24,
+        "num_samples": 24103,
+        "MPJPE_mm": 130.3854596588656,
+        "PA_MPJPE_mm": 82.0571670163171,
+        "PCK3D_50mm": 0.4425244437068691,
+        "PCK3D_100mm": 0.7705420487076298,
+        "AUC_0_150mm": 0.5411218498210414,
+        "per_joint_PA_MPJPE_mm": {
+          "pelvis": 48.59187920665972,
+          "left_hip": 50.4126501457034,
+          "right_hip": 49.762050911165666,
+          "spine1": 54.612692164149415,
+          "left_knee": 90.09166365427974,
+          "right_knee": 82.24455682927075,
+          "spine2": 53.449334715576,
+          "left_ankle": 111.63578442839923,
+          "right_ankle": 111.96051253671182,
+          "spine3": 52.00669208342192,
+          "left_foot": 123.03845499470782,
+          "right_foot": 123.76316525209222,
+          "neck": 47.53526549385952,
+          "left_collar": 42.51789215922212,
+          "right_collar": 43.91447960243653,
+          "head": 57.02544550539255,
+          "left_shoulder": 48.29854874415506,
+          "right_shoulder": 50.254633039524,
+          "left_elbow": 75.6921061879758,
+          "right_elbow": 71.40956568788079,
+          "left_wrist": 132.12530841342553,
+          "right_wrist": 130.20406948638814,
+          "left_hand": 158.51340449003933,
+          "right_hand": 160.311852659173
+        }
+      },
+      {
+        "joint_set": "J14",
+        "num_joints": 14,
+        "num_samples": 24103,
+        "MPJPE_mm": 137.4546838606729,
+        "PA_MPJPE_mm": 85.2887885622615,
+        "PCK3D_50mm": 0.3544016453197883,
+        "PCK3D_100mm": 0.7423349790482513,
+        "AUC_0_150mm": 0.5048719483644597,
+        "per_joint_PA_MPJPE_mm": {
+          "right_ankle": 112.90230744160056,
+          "right_knee": 77.76579851390298,
+          "right_hip": 59.7360313981596,
+          "left_hip": 57.117470395531804,
+          "left_knee": 85.69734064895307,
+          "left_ankle": 113.69040067031324,
+          "right_wrist": 131.2842203111102,
+          "right_elbow": 65.73414330792406,
+          "right_shoulder": 64.85578426165553,
+          "left_shoulder": 53.93985198484884,
+          "left_elbow": 72.82189014455065,
+          "left_wrist": 135.33234242828175,
+          "neck": 55.04960700928208,
+          "head": 108.11585135554654
+        }
+      },
+      {
+        "joint_set": "J12",
+        "num_joints": 12,
+        "num_samples": 24103,
+        "MPJPE_mm": 135.1134120391211,
+        "PA_MPJPE_mm": 84.22686772788774,
+        "PCK3D_50mm": 0.3867672074015683,
+        "PCK3D_100mm": 0.7555733034615332,
+        "AUC_0_150mm": 0.5193542141499362,
+        "per_joint_PA_MPJPE_mm": {
+          "right_ankle": 111.3023944097616,
+          "right_knee": 78.06397585463169,
+          "right_hip": 58.00096104384721,
+          "left_hip": 55.89400725476661,
+          "left_knee": 85.73769890796152,
+          "left_ankle": 111.54025285994577,
+          "right_wrist": 127.81832219553837,
+          "right_elbow": 61.883637076937525,
+          "right_shoulder": 62.992167213801736,
+          "left_shoulder": 57.951701927944086,
+          "left_elbow": 68.24978921396766,
+          "left_wrist": 131.28750477554897
+        }
+      }
+    ],
+    "per_sequence_SMPL24_adapter": {
+      "P1_14_outdoor_climb": {
+        "n": 1270,
+        "PA_MPJPE_mm": 62.25777058529678
+      },
+      "P2_23_outdoor_hug_tree": {
+        "n": 1086,
+        "PA_MPJPE_mm": 72.58083553110158
+      },
+      "P3_31_outdoor_workout": {
+        "n": 1216,
+        "PA_MPJPE_mm": 70.85729372012992
+      },
+      "P3_32_outdoor_soccer_warmup_a": {
+        "n": 1084,
+        "PA_MPJPE_mm": 71.1220512553712
+      },
+      "P3_33_outdoor_soccer_warmup_b": {
+        "n": 1433,
+        "PA_MPJPE_mm": 59.81773999862998
+      },
+      "P5_42_indoor_dancing": {
+        "n": 1291,
+        "PA_MPJPE_mm": 122.87846608625289
+      },
+      "P5_44_indoor_rom": {
+        "n": 1381,
+        "PA_MPJPE_mm": 77.60790822411231
+      },
+      "P6_49_outdoor_big_stairs_down": {
+        "n": 1559,
+        "PA_MPJPE_mm": 84.46367417675029
+      },
+      "P6_50_outdoor_workout": {
+        "n": 1532,
+        "PA_MPJPE_mm": 80.2575222618084
+      },
+      "P6_51_outdoor_dancing": {
+        "n": 1427,
+        "PA_MPJPE_mm": 64.7979797339095
+      },
+      "P7_57_outdoor_rock_chair": {
+        "n": 1558,
+        "PA_MPJPE_mm": 89.52530190150982
+      },
+      "P7_59_outdoor_rom": {
+        "n": 1839,
+        "PA_MPJPE_mm": 87.2869229592149
+      },
+      "P7_60_outdoor_workout": {
+        "n": 1693,
+        "PA_MPJPE_mm": 71.97161263079856
+      },
+      "P8_64_outdoor_skateboard": {
+        "n": 1704,
+        "PA_MPJPE_mm": 70.63465836882817
+      },
+      "P8_68_outdoor_handstand": {
+        "n": 1606,
+        "PA_MPJPE_mm": 119.51908090607776
+      },
+      "P8_69_outdoor_cartwheel": {
+        "n": 656,
+        "PA_MPJPE_mm": 93.44620858723786
+      },
+      "P9_76_outdoor_sitting": {
+        "n": 1768,
+        "PA_MPJPE_mm": 91.95960957155165
+      }
+    }
+  }
+}

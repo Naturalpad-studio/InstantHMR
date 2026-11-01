@@ -80,6 +80,9 @@ def main() -> int:
                    help="Build the teacher's continuous regression head instead "
                         "of the linear 204-vector head. A changed head shape is "
                         "exactly the class of change this exists to gate.")
+    p.add_argument("--prev-token", dest="prev_token", action="store_true",
+                   help="Foot lock: the previous-pose query, the contact head and "
+                        "the three foot-lock losses, all at weight 1.")
     p.add_argument("--pretrained", action="store_true",
                    help="Load the timm weights too. Off by default: the head "
                         "geometry this checks does not depend on them.")
@@ -105,6 +108,9 @@ def main() -> int:
         cfg.root_rot_loss = True
     if args.exact_landmarks:
         cfg.exact_landmarks = True
+    if args.prev_token:
+        cfg.prev_token = cfg.contact_head = True
+        cfg.w_contact = cfg.w_zero_vel = cfg.w_foot_mocap = 1.0
     if args.backbone:
         cfg.backbone = args.backbone
     if args.image_size is not None:
@@ -117,7 +123,8 @@ def main() -> int:
                                crop_centre_fix=cfg.crop_centre_fix,
                                image_size=cfg.image_size,
                                context_crops=args.context_crops,
-                               crop_windows=args.crop_windows)
+                               crop_windows=args.crop_windows,
+                               temporal=T.temporal_kwargs(cfg))
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, num_workers=0)
     batch = {k: (v.to(T.device) if torch.is_tensor(v) else v)
              for k, v in next(iter(loader)).items()}
@@ -144,7 +151,8 @@ def main() -> int:
     # even on a broken model -- which is how this was missed the first time.
     try:
         for _ in range(2):
-            out = ddp(batch["image"], batch["cliff_cond"].to(T.device))
+            out = ddp(batch["image"], batch["cliff_cond"].to(T.device),
+                      batch.get("prev_pose"), batch.get("has_prev"))
             crit(out, batch)["total_loss"].backward()
     except RuntimeError as e:
         print(f"\n❌ DDP rejected {cfg.backbone}:\n{e}")

@@ -1,0 +1,20 @@
+{
+ "ckpt": "instanthmr_distill_train/runs/g11Ap_b4/last.pth",
+ "trials": 156,
+ "masked": {
+  "slide_mm": 13.652990772598686,
+  "slide_median_mm": 9.659798582033709,
+  "mocap_slide_mm": 1.833724014677916,
+  "foot_err_mm": 30.67944011345725,
+  "contact_f1": 0.9807184748636739,
+  "n_contact_pairs": 166663
+ },
+ "feedback": {
+  "slide_mm": 11.070269377794858,
+  "slide_median_mm": 7.659354394283289,
+  "mocap_slide_mm": 1.833724014677916,
+  "foot_err_mm": 30.410201997983858,
+  "contact_f1": 0.9806047477931363,
+  "n_contact_pairs": 166663
+ }
+}

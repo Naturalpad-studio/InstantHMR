@@ -129,6 +129,14 @@ DATASETS: dict[str, Dataset] = {
               "download imageFiles.zip and unzip so that sequence folders "
               "(courtyard_arguing_00/, ...) sit directly under the image dir.",
     ),
+    "semelle": Dataset(
+        name="semelle",
+        splits=("semelle_train",),
+        method="cli",
+        notes="Private: ../semelle-kahina videos labelled by "
+              "datasets_pipeline/semelle/label.py (teacher pose, insole contact, "
+              "mocap feet). Its rows and undistorted frames are local.",
+    ),
     "harmony4d": Dataset(
         name="harmony4d",
         splits=("harmony4d_train", "harmony4d_test"),

@@ -29,7 +29,7 @@ Usage
     python demo.py --image path/to/photo.jpg --mhr-model
 
     # MHR-only student: the rig is mandatory and auto-selected
-    python demo.py --image path/to/photo.jpg --model models/instanthmr_mhr_only.onnx
+    python demo.py --video vid1.mp4 --model models/instanthmr_mhr_only.onnx
 
     # Same, but decoding the mesh from the asset folder at a chosen LOD
     python demo.py --image path/to/photo.jpg --mhr-assets models/mhr_assets --mhr-lod 3
@@ -43,6 +43,11 @@ Usage
 
     # Live camera (index 0)
     python demo.py --camera 0
+
+    # Foot-contact model (--prev-token checkpoint): each person is fed their own
+    # prediction from 5 frames earlier, and planted feet are drawn red, with a
+    # per-foot contact-probability plot. --no-prev withholds the previous pose.
+    python demo.py --video clip.mp4 --model models/instanthmr_g11Ap_b4_ep119.onnx
 """
 
 from __future__ import annotations
@@ -122,6 +127,18 @@ def parse_args() -> argparse.Namespace:
              "needs one; without it the demo falls back to 1.05x the image "
              "diagonal, which mis-places the person in depth on any camera "
              "whose true focal differs.",
+    )
+    p.add_argument(
+        "--no-prev", action="store_true",
+        help="Prev-token models only: withhold the previous pose on every frame "
+             "(the single-frame model). By default each tracked person is fed "
+             "their own prediction from --prev-lag frames earlier.",
+    )
+    p.add_argument(
+        "--prev-lag", type=int, default=5, metavar="N",
+        help="Processed frames between a prediction and the frame it feeds "
+             "(default: 5, as in the benchmarks; the token was trained on pairs "
+             "5-20 frames apart).",
     )
     p.add_argument(
         "--smoothing-filter", action="store_true",
@@ -237,6 +254,8 @@ def build_pipeline(args: argparse.Namespace, mhr=None) -> PosePipeline:
         batch_persons=not args.no_batch_persons,
         mhr=mhr,
         focal=args.focal,
+        use_prev=not args.no_prev,
+        prev_lag=args.prev_lag,
     )
 
 
@@ -335,6 +354,10 @@ def build_all(args: argparse.Namespace):
     model_path = resolve_model_path(args)
     mhr = build_mhr(args, required=_model_needs_mhr(model_path))
     pipeline = build_pipeline(args, mhr=mhr)
+    if pipeline.hmr.has_prev_input:
+        print(f"Prev-token model: previous pose "
+              f"{f'fed back from {args.prev_lag} frames earlier' if pipeline.feeds_prev else 'withheld (--no-prev)'}; "
+              f"foot contact shown in red.", flush=True)
     viz = RerunVisualizer(
         application_id="instanthmr_demo",
         spawn_viewer=not args.no_spawn,

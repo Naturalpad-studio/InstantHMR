@@ -1,0 +1,43 @@
+{
+  "/tmp/claude-1000/-home-madjel-Projects-gitpackages-sam3d-student-release/8b8b1032-085a-4960-bbc2-9b3487321cd3/scratchpad/ck/oldhf/oldhf/instanthmr.pth": {
+    "ckpt": "/tmp/claude-1000/-home-madjel-Projects-gitpackages-sam3d-student-release/8b8b1032-085a-4960-bbc2-9b3487321cd3/scratchpad/ck/oldhf/oldhf/instanthmr.pth",
+    "dataset": "EMDB1",
+    "bbox": "gt-joints",
+    "stride": 1,
+    "n": 24103,
+    "fit_iters": 0,
+    "epoch": 297,
+    "source": null,
+    "fit_residual_mm": null,
+    "PVE_direct_mm": 144.21723528444417,
+    "PVE_published_mm": 150.48613197099746,
+    "PA_PVE_direct_mm": 95.13054542358611,
+    "J14_h36m_direct_MPJPE_mm": 125.79401397705078,
+    "J14_h36m_direct_PA_MPJPE_mm": 74.73550725538553,
+    "MPJPE_mm": null,
+    "PA_MPJPE_mm": null,
+    "PVE_mm": null,
+    "PA_PVE_mm": null,
+    "J14_h36m_viamesh_MPJPE_mm": null,
+    "J14_h36m_viamesh_PA_MPJPE_mm": null,
+    "per_sequence_PA_MPJPE_mm": {
+      "P1_14_outdoor_climb": 57.46953455053445,
+      "P2_23_outdoor_hug_tree": 65.39207672154404,
+      "P3_31_outdoor_workout": 68.43899828016741,
+      "P3_32_outdoor_soccer_warmup_a": 66.03507987022952,
+      "P3_33_outdoor_soccer_warmup_b": 56.33767162537286,
+      "P5_42_indoor_dancing": 115.1491631769016,
+      "P5_44_indoor_rom": 72.83147589287064,
+      "P6_49_outdoor_big_stairs_down": 76.44488593620376,
+      "P6_50_outdoor_workout": 75.72554039848404,
+      "P6_51_outdoor_dancing": 58.5532042313216,
+      "P7_57_outdoor_rock_chair": 82.00943258632788,
+      "P7_59_outdoor_rom": 79.89864730225953,
+      "P7_60_outdoor_workout": 64.36161008820217,
+      "P8_64_outdoor_skateboard": 64.46712642460376,
+      "P8_68_outdoor_handstand": 102.39527335660438,
+      "P8_69_outdoor_cartwheel": 85.55792106233463,
+      "P9_76_outdoor_sitting": 79.03644060252135
+    }
+  }
+}

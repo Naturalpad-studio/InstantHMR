@@ -1,0 +1,20 @@
+{
+ "ckpt": "instanthmr_distill_train/runs/g11Cp_b4/best_student_model_v3.pth",
+ "trials": 156,
+ "masked": {
+  "slide_mm": 23.07777380974508,
+  "slide_median_mm": 16.299346334307465,
+  "mocap_slide_mm": 1.833724014677916,
+  "foot_err_mm": 50.040571615580056,
+  "contact_f1": 0.7341644483987046,
+  "n_contact_pairs": 166663
+ },
+ "feedback": {
+  "slide_mm": 23.082563123409642,
+  "slide_median_mm": 16.30244750229059,
+  "mocap_slide_mm": 1.833724014677916,
+  "foot_err_mm": 50.0351350748647,
+  "contact_f1": 0.7338291248702871,
+  "n_contact_pairs": 166663
+ }
+}

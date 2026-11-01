@@ -49,6 +49,7 @@ from benchlib.detboxes import apply_detector_boxes  # noqa: E402
 from benchlib import joints as J               # noqa: E402
 from benchlib import metrics as M              # noqa: E402
 from eval_3dpw_ckpt import predict             # noqa: E402
+from benchlib import feedback as FB            # noqa: E402
 
 MM = 1000.0
 SMPL24_HIPS = (J.SMPL["left_hip"], J.SMPL["right_hip"])
@@ -81,6 +82,9 @@ def parse_args():
     p.add_argument("--cliff-focal", dest="cliff_focal", action="store_true",
                    default=None)
     p.add_argument("--no-cliff-focal", dest="cliff_focal", action="store_false")
+    p.add_argument("--prev", default="masked", choices=["masked", "feedback"],
+                   help="--prev-token checkpoints only; see eval_3dpw_ckpt.py")
+    p.add_argument("--prev-lag", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--device", default="cuda")
@@ -228,8 +232,15 @@ def main():
         model = T.InstantHMRStudent(cfgs[ck_path], pretrained=False).to(device)
         ck = torch.load(ck_path, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model_state_dict"])
-        pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp,
-                                       exact_landmarks=exact_lm)
+        fb = args.prev == "feedback" and cfgs[ck_path].prev_token
+        if fb:
+            pred, idx, n_dropped = FB.predict_feedback(
+                model, ds, mhr, device, lag=args.prev_lag, use_amp=cfg.use_amp,
+                exact_landmarks=exact_lm, batch_size=args.batch_size,
+                num_workers=args.num_workers)
+        else:
+            pred, idx, n_dropped = predict(model, loader, mhr, device, cfg.use_amp,
+                                           exact_landmarks=exact_lm)
         del model
         torch.cuda.empty_cache()
 
@@ -240,6 +251,9 @@ def main():
                          for s in ("J14", "J12")]
 
         kept = [ds.samples[i] for i in idx]
+        pj = np.einsum("jk,nkc->njc", W_adapt, pred - pred.mean(axis=1, keepdims=True))
+        hips = lambda x: 0.5 * (x[:, SMPL24_HIPS[0]] + x[:, SMPL24_HIPS[1]])
+        jit = FB.accel(pj, gt_arr, hips(pj), hips(gt_arr), kept)
         per_seq = {}
         for name in seqs:
             m = np.array([s["sequence"] == name for s in kept])
@@ -251,6 +265,8 @@ def main():
             ckpt=ck_path, dataset="EMDB1", split="emdb1", stride=args.stride,
             bbox=args.bbox, detector=det_stats,
             adapter=str(args.adapter), landmarks=args.landmarks,
+            prev="feedback" if fb else "masked",
+            prev_lag=args.prev_lag if fb else None, accel_SMPL24_adapter=jit,
             epoch=ck.get("epoch"), source=ck.get("source"),
             n=int(pred.shape[0]), n_dropped=n_dropped,
             num_sequences=len(seqs), results=rows,
@@ -261,6 +277,9 @@ def main():
         print(f"  {run:<24s} {name:<6s} {str(ck.get('epoch')):>4s} "
               f"{head['PA_MPJPE_mm']:13.2f} {head['MPJPE_mm']:16.2f} "
               f"{rows[1]['PA_MPJPE_mm']:8.2f} {rows[2]['PA_MPJPE_mm']:8.2f}"
+              + (f"  accel {jit['accel_mm']:.2f} err {jit['accel_err_mm']:.2f} mm/f^2"
+                 if jit["n_triplets"] else "")
+              + ("  [feedback]" if fb else "")
               + (f"   ({n_dropped} dropped)" if n_dropped else ""), flush=True)
 
     if args.out:

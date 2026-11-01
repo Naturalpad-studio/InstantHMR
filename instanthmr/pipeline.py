@@ -8,6 +8,7 @@ detector and HMR timings so the demo can surface them.
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,7 @@ import numpy as np
 
 from .detector import RFDETRDetector
 from .inference import InstantHMR, HMRPrediction
+from .smoothing import _Tracker
 
 
 @dataclass
@@ -49,6 +51,12 @@ def _expand_bbox(bbox: np.ndarray, w: int, h: int, expand: float) -> np.ndarray:
     ], dtype=np.float32)
 
 
+@dataclass
+class _Box:
+    """What :class:`instanthmr.smoothing._Tracker` reads off a person."""
+    bbox: np.ndarray
+
+
 class PosePipeline:
     """Full RF-DETR → InstantHMR pipeline.
 
@@ -79,6 +87,14 @@ class PosePipeline:
             person in depth on any camera whose true focal differs.
         cliff_focal: Override the conditioning form; normally read from the
             ONNX metadata. See :class:`instanthmr.inference.InstantHMR`.
+        use_prev: For a prev-token graph, feed each tracked person their own
+            prediction from ``prev_lag`` frames earlier (IoU tracking on the
+            detector boxes); the previous pose is withheld on a track's first
+            ``prev_lag`` frames. ``False`` always withholds it. Ignored by
+            other graphs.
+        prev_lag: Processed frames between a prediction and the frame it
+            feeds. 5 (167 ms at 30 fps) is what the benchmarks use, inside
+            the 5-20 frame pairs the token was trained on.
 
     Example
     -------
@@ -100,6 +116,8 @@ class PosePipeline:
         mhr: object | None = None,
         focal: float | None = None,
         cliff_focal: bool | None = None,
+        use_prev: bool = True,
+        prev_lag: int = 5,
     ):
         if detector_stride < 1:
             raise ValueError("detector_stride must be >= 1")
@@ -138,6 +156,10 @@ class PosePipeline:
         self._frame_idx = 0
         self._last_detections: list[dict] = []
         self._last_bbox: Optional[np.ndarray] = None
+        self.feeds_prev = use_prev and self.hmr.has_prev_input
+        self._prev_lag = max(1, prev_lag)
+        self._tracker = _Tracker()
+        self._history: dict[int, deque] = {}   # track id -> last prev_lag prev_pose()s
 
     @staticmethod
     def _warmup_mhr(mhr, max_persons: int) -> None:
@@ -196,20 +218,31 @@ class PosePipeline:
         detections = detections[: self._max_persons]
         outputs: list[HMRPrediction] = []
         t1 = time.perf_counter()
+        ids, prev = [], [None] * len(detections)
+        if self.feeds_prev:
+            ids = self._tracker.assign([_Box(d["bbox"]) for d in detections])
+            prev = [h[0] if len(h) == self._prev_lag else None
+                    for h in (self._history.get(t, ()) for t in ids)]
         if detections:
             if self._batch_persons and len(detections) > 1:
                 # Always pad to _max_persons so ONNX sees a constant batch
                 # shape and never triggers a mid-demo recompilation.
                 outputs = self.hmr.predict_batch(
-                    image_rgb, detections, padded_to=self._max_persons
+                    image_rgb, detections, padded_to=self._max_persons, prev=prev,
                 )
             else:
-                for det in detections:
+                for det, pp in zip(detections, prev):
                     outputs.append(self.hmr.predict(
                         image_rgb,
                         bbox=det["bbox"],
                         confidence=det["confidence"],
+                        prev=pp,
                     ))
+        if self.feeds_prev:
+            for t, o in zip(ids, outputs):
+                self._history.setdefault(t, deque(maxlen=self._prev_lag)).append(o.prev_pose())
+            for t in set(self._history) - self._tracker.active_ids:
+                del self._history[t]
         hmr_ms = (time.perf_counter() - t1) * 1000.0
 
         if outputs:

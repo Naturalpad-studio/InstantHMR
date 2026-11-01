@@ -36,8 +36,8 @@ Usage
 
     # or point at a specific checkpoint / output
     python ./tools/pth_to_onnx.py \
-        --ckpt   ./instanthmr_distill_train/runs/g8h_s1/g8h_s1/best_student_model_v3.pth \
-        --output ./models/instanthmr.onnx
+        --ckpt   ./instanthmr_distill_train/runs/g8h_lr1x_e600/g8h_lr1x_e600/best_student_model_v3.pth \
+        --output ./models/instanthmr_g8h_lr1x_e600.onnx
 """
 import argparse
 import importlib
@@ -177,28 +177,35 @@ def main() -> None:
     # --- Export FP32 ONNX (Cell 15 recipe) ---
     dummy_img = torch.randn(1, 3, cfg.image_size, cfg.image_size, device=device)
     dummy_cliff = torch.randn(1, 3, device=device)
+    inputs, input_names = (dummy_img, dummy_cliff), ["image", "cliff_cond"]
+    prev_token = bool(getattr(cfg, "prev_token", False))
+    if prev_token:
+        # --prev-token: the previous pose (T.PREV_DIM floats) and its 0/1 flag
+        # are graph inputs, the per-foot contact logits a fifth output.
+        inputs += (torch.randn(1, T.PREV_DIM, device=device), torch.ones(1, device=device))
+        input_names += ["prev_pose", "has_prev"]
+    print(f"  prev_token   : {prev_token}")
 
     # Ask the wrapper how many tensors it returns instead of hard-coding five:
     # train_distill_mhr_only.py drops `joints_3d` from the tuple.
     with torch.no_grad():
-        n_out = len(deploy(dummy_img, dummy_cliff))
+        n_out = len(deploy(*inputs))
     if n_out not in (4, 5):
         sys.exit(f"[error] unexpected deploy wrapper output count: {n_out} (expected 4 or 5)")
-    output_keys = ALL_OUTPUT_KEYS[:n_out]
+    output_keys = (ALL_OUTPUT_KEYS[:4] + ["contact_logits"] if prev_token
+                   else ALL_OUTPUT_KEYS[:n_out])
     print(f"  graph outputs: {n_out} -> {output_keys}")
-    if n_out == 4:
+    if "joints_3d" not in output_keys:
         print("  note: no 'joints_3d' output — the 70 keypoints are derived from the\n"
               "        MHR forward pass at inference time (needs --mhr-model / --mhr-assets\n"
               "        in demo.py).")
 
-    dynamic_axes = {"image": {0: "batch"}, "cliff_cond": {0: "batch"}}
-    for k in output_keys:
-        dynamic_axes[k] = {0: "batch"}
+    dynamic_axes = {k: {0: "batch"} for k in input_names + output_keys}
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
-        deploy, (dummy_img, dummy_cliff), str(args.output),
-        input_names=["image", "cliff_cond"], output_names=output_keys,
+        deploy, inputs, str(args.output),
+        input_names=input_names, output_names=output_keys,
         dynamic_axes=dynamic_axes, opset_version=args.opset,
     )
     # Stamp which CLIFF conditioning this graph expects. The vector has the
@@ -210,7 +217,8 @@ def main() -> None:
         for k, v in (("cliff_focal", str(bool(getattr(cfg, "cliff_focal", False))).lower()),
                      ("bound_scales", str(bool(getattr(cfg, "bound_scales", False))).lower()),
                      ("arch", arch),
-                     ("image_size", str(int(cfg.image_size)))):
+                     ("image_size", str(int(cfg.image_size))),
+                     ("prev_token", str(prev_token).lower())):
             e = m.metadata_props.add()
             e.key, e.value = k, v
         onnx.save(m, str(args.output))
@@ -228,7 +236,7 @@ def main() -> None:
         import onnxruntime as ort
         sess = ort.InferenceSession(str(args.output), providers=["CPUExecutionProvider"])
         in_names = [i.name for i in sess.get_inputs()]
-        outs = sess.run(None, {in_names[0]: dummy_img.numpy(), in_names[1]: dummy_cliff.numpy()})
+        outs = sess.run(None, {n: x.numpy() for n, x in zip(in_names, inputs)})
         print(f"  onnxruntime OK | inputs {in_names}")
         for o, v in zip(sess.get_outputs(), outs):
             v = np.asarray(v)
@@ -239,7 +247,7 @@ def main() -> None:
         # weights, different forward. A dropped tanh remap shows up here as a
         # large mhr_params delta while every tensor keeps its right shape.
         with torch.no_grad():
-            ref = deploy(dummy_img, dummy_cliff)
+            ref = deploy(*inputs)
         worst = max(float(np.abs(np.asarray(o) - r.numpy()).max())
                     for o, r in zip(outs, ref))
         print(f"  torch<->onnx max abs diff: {worst:.3e}")

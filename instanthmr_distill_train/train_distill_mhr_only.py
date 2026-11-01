@@ -49,6 +49,7 @@ import copy
 import json
 import math
 import random
+import re
 import gc
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -195,6 +196,9 @@ class DistillConfig:
     # always window 0, i.e. the runtime crop of a perfect detector box -- the
     # baseline framing, read from a window corpus at any --image-size.
     window_mode: str = "random"
+    # window_mode "random" only: probability of window 0 (the standard crop);
+    # the other windows share the rest. None = all K equally likely (v4, g10f).
+    window0_p: float | None = None
     max_images: int | None = None   
     per_dataset_caps: dict = field(default_factory=lambda: {"sam3d_gt_harmony4d": 300_000})
     val_split: float = 0.1
@@ -408,6 +412,43 @@ class DistillConfig:
     # is the actual fix.  It is kept as cheap insurance for the first epoch of a
     # real run, where the trunk is still random.
     kp3d_warmup_steps: int = 2000
+
+    # --- Foot lock (--prev-token): the decoder gets one extra query carrying
+    # --- the previous frame's 70 keypoints + cam_trans, or a learned "no
+    # --- previous pose" embedding. Keypoints, not MHR parameters, because the
+    # --- flip augmentation mirrors the labels and the parameters cannot be
+    # --- mirrored (the reason loss_pose is masked to m_noflip). All off by
+    # --- default, so every existing preset stays bit-identical.
+    prev_token: bool = False
+    prev_mask_p: float = 0.5        # P(previous pose withheld) per sample
+    # Withhold the previous pose on every sample without a real earlier frame
+    # (stills, a missing pair). Off, a still's "previous" pose is its own GT +
+    # noise, ~87% of the mix, and the model learns prev ~= now: fed its own
+    # prediction 5 frames back on 3DPW test, g11C goes 39.85 -> 43.58 J14 PA.
+    prev_pairs_only: bool = False
+    # Noise on the previous pose fed to the token, standing in for the model's
+    # own error at inference: per-joint metres, cam x/z and y/z, log-depth.
+    # Set to g10m75_b4's per-frame error on 512 held-in Harmony4D / AIC crops
+    # (2026-10-30): joints 2.3-5.3 cm per axis, x/z 0.016-0.021, y/z
+    # 0.020-0.030, log depth 0.032-0.037.
+    prev_noise_joint: float = 0.035
+    prev_noise_xy: float = 0.02
+    prev_noise_logz: float = 0.035
+    # Splits whose crops are named <...>_<frame>_p<id> with consecutive
+    # annotations `pair_frame_step` frames apart, and the largest gap (in
+    # annotation steps) drawn for each. Stills use their own GT as "previous".
+    pair_gaps: dict = field(default_factory=lambda: {"harmony4d": 2, "semelle": 4})
+    pair_frame_step: int = 5
+    # Contact from GT foot motion where no measured contact exists (Harmony4D):
+    # the mean displacement of a foot's 4 keypoints between the pair, under
+    # contact_thr is contact, over noncontact_thr is not, in between masked.
+    contact_thr: float = 0.020
+    noncontact_thr: float = 0.050
+    contact_head: bool = False
+    w_contact: float = 0.0          # BCE on the per-foot contact logits
+    w_zero_vel: float = 0.0         # foot displacement vs the previous-pose input, in contact
+    w_foot_mocap: float = 0.0       # semelle: mocap foot keypoints (camera frame), replacing
+                                    # the teacher's in loss_3d_native
     # REMOVED w.r.t. train_distill_optimized_correctives.py:
     #   w_structural / w_feet  — they glued the 3D head to the mesh; no head, no glue.
     #   w_bone_length          — MHR enforces bone lengths through its scale params.
@@ -494,6 +535,10 @@ def config_from_checkpoint(state, ckpt_path=None, **overrides):
     cfg.cont_head = any(k.startswith("cont_head.") for k in state)
     cfg.root_rot_loss = cfg.cont_head
     prov["cont_head"] = "checkpoint weights"
+    # --prev-token / the contact head are parameters, so the weights say so.
+    cfg.prev_token = any(k.startswith("prev_proj.") for k in state)
+    cfg.contact_head = any(k.startswith("contact_head.") for k in state)
+    prov["prev_token"] = prov["contact_head"] = "checkpoint weights"
 
     # --exact-landmarks leaves NO trace in the weights: it changes which
     # operator two training losses use, not the graph. So it can only come from
@@ -618,6 +663,48 @@ def _apply_label_geometry(M_total, aug_flip, angle, joints_2d, joints_2d_vis,
     return joints_2d, joints_2d_vis, joints_3d, cam_trans, cx, cy, cos_t, sin_t
 
 
+# Left then right: ankle, big toe tip, small toe tip, heel. FLIP_PERM swaps the
+# two halves, so a flipped sample keeps this order with its sides exchanged.
+FOOT_KP = np.array([13, 15, 16, 17, 14, 18, 19, 20])
+PREV_DIM = 70 * 3 + 3       # keypoints + (x/z, y/z, log z) of cam_trans
+PAIR_NAME = re.compile(r"^(.*)_(\d+)_p(\d+)$")
+
+
+def _geom_points(pts, aug_flip, angle):
+    """joints_3d's half of _apply_label_geometry, for other (K, 3) point sets."""
+    pts = pts.copy()
+    if aug_flip > 0.5:
+        pts[:, 0] = -pts[:, 0]
+        pts = pts[FLIP_PERM]
+    rad = math.radians(angle)
+    R_v = np.array([[math.cos(rad), math.sin(rad)], [-math.sin(rad), math.cos(rad)]], dtype=np.float32)
+    pts[:, :2] = pts[:, :2] @ R_v.T
+    return pts
+
+
+def _geom_cam(cam, aug_flip, angle):
+    """cam_trans's half of _apply_label_geometry."""
+    cam = cam.copy()
+    if aug_flip > 0.5:
+        cam[0] = -cam[0]
+    rad = math.radians(angle)
+    R_v = np.array([[math.cos(rad), math.sin(rad)], [-math.sin(rad), math.cos(rad)]], dtype=np.float32)
+    cam[:2] = R_v @ cam[:2]
+    return cam
+
+
+def temporal_kwargs(cfg):
+    """The dataset's `temporal` argument: None unless --prev-token, so the
+    sample dict and the random stream of every existing preset are unchanged."""
+    if not getattr(cfg, "prev_token", False):
+        return None
+    return dict(mask_p=cfg.prev_mask_p, noise_joint=cfg.prev_noise_joint,
+                noise_xy=cfg.prev_noise_xy, noise_logz=cfg.prev_noise_logz,
+                pair_gaps=dict(cfg.pair_gaps), frame_step=cfg.pair_frame_step,
+                contact_thr=cfg.contact_thr, noncontact_thr=cfg.noncontact_thr,
+                pairs_only=getattr(cfg, "prev_pairs_only", False))
+
+
 class SAM3DStudentDataset(Dataset):
     def __init__(self, data_root: str,
                  image_size: int = 224, max_images: int | None = None,
@@ -635,10 +722,13 @@ class SAM3DStudentDataset(Dataset):
                  context_crops: bool = False, v3_box_min: float = 0.6,
                  v3_box_max: float = 2.0, v3_shift: float = 0.15,
                  v3_lanczos: bool = False, crop_windows: bool = False,
-                 window_mode: str = "random"):
+                 window_mode: str = "random", window0_p: float | None = None,
+                 temporal: dict | None = None):
         super().__init__()
+        self.temporal = temporal
         self.crop_windows = crop_windows
         self.window_mode = window_mode
+        self.window0_p = window0_p
         self.v3_interp = cv2.INTER_LANCZOS4 if v3_lanczos else cv2.INTER_LINEAR
         self.image_size = image_size
         self.context_crops = context_crops
@@ -875,6 +965,87 @@ class SAM3DStudentDataset(Dataset):
                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
         return Image.fromarray(img_np), M_total, aug_active, aug_flip, angle, centre, bpx
 
+    def _temporal_sample(self, npz_path, ann, aug_flip, angle):
+        """Previous pose, foot contact and mocap feet for --prev-token.
+
+        All of it is built in the original camera frame and then moved with
+        this sample's own flip and rotation, so it lives in the same frame as
+        joints_3d / cam_trans. "Previous" is the annotation `frame_step * g`
+        frames earlier on a video split, else this sample's own GT; either way
+        it is noised like a prediction and withheld with probability mask_p.
+        Validation (augment=False) always withholds it."""
+        tc = self.temporal
+        j_cur = ann["joints_3d"].astype(np.float32)
+        t_cur = ann["cam_trans"].astype(np.float32)
+        j_prev, t_prev, has_pair = j_cur, t_cur, 0.0
+        fm_prev = None
+        split = npz_path.parent.parent.name
+        gap_max = next((g for k, g in tc["pair_gaps"].items() if k in split), 0)
+        m = PAIR_NAME.match(npz_path.stem) if (self.augment and gap_max) else None
+        if m is not None:
+            f = int(m.group(2)) - tc["frame_step"] * random.randint(1, gap_max)
+            p = npz_path.with_name(f"{m.group(1)}_{f:0{len(m.group(2))}d}_p{m.group(3)}.npz")
+            if f >= 0 and p.exists():
+                with np.load(p) as z:
+                    jp, tp = z["joints_3d"].astype(np.float32), z["cam_trans"].astype(np.float32)
+                    if "foot_mocap" in z:
+                        fm_prev = (z["foot_mocap"].astype(np.float32) + tp,
+                                   z["foot_mocap_valid"].astype(np.float32))
+                # A person-id swap between the two frames shows up as a jump.
+                if np.linalg.norm(tp - t_cur) < 0.5:
+                    j_prev, t_prev, has_pair = jp, tp, 1.0
+                else:
+                    fm_prev = None
+
+        contact, c_valid = np.zeros(2, np.float32), np.zeros(2, np.float32)
+        if "contact" in ann:
+            contact = ann["contact"].astype(np.float32)
+            c_valid = ann["contact_valid"].astype(np.float32)
+        elif has_pair:
+            d = np.linalg.norm((j_cur + t_cur)[FOOT_KP] - (j_prev + t_prev)[FOOT_KP], axis=1)
+            d = d.reshape(2, 4).mean(1)
+            contact = (d < tc["contact_thr"]).astype(np.float32)
+            c_valid = ((d < tc["contact_thr"]) | (d > tc["noncontact_thr"])).astype(np.float32)
+        fm, fm_valid = np.zeros((70, 3), np.float32), np.zeros(70, np.float32)
+        if "foot_mocap" in ann:
+            fm = np.nan_to_num(ann["foot_mocap"].astype(np.float32))
+            fm_valid = ann["foot_mocap_valid"].astype(np.float32)
+
+        has_prev = 1.0 if (self.augment and random.random() >= tc["mask_p"]) else 0.0
+        if tc.get("pairs_only") and not has_pair:
+            has_prev = 0.0
+        rng = np.random.default_rng(random.getrandbits(32))
+        jn = j_prev + rng.normal(0.0, tc["noise_joint"], j_prev.shape).astype(np.float32)
+        tn = t_prev.copy()
+        tn[:2] += rng.normal(0.0, tc["noise_xy"], 2).astype(np.float32) * tn[2]
+        tn[2] *= math.exp(rng.normal(0.0, tc["noise_logz"]))
+
+        jn, tn = _geom_points(jn, aug_flip, angle), _geom_cam(tn, aug_flip, angle)
+        disp = (j_cur + t_cur) - (j_prev + t_prev)
+        if fm_prev is not None:
+            # The markers' motion where both frames have them: the teacher's
+            # feet jitter, and a rolling foot in contact is not motionless.
+            both = (fm_valid * fm_prev[1]) > 0
+            disp[both] = ((fm + t_cur) - fm_prev[0])[both]
+        disp = _geom_points(disp, aug_flip, angle)[FOOT_KP]
+        fm = _geom_points(fm, aug_flip, angle)
+        if aug_flip > 0.5:
+            fm_valid = fm_valid[FLIP_PERM]
+            contact, c_valid = contact[::-1].copy(), c_valid[::-1].copy()
+        z = max(float(tn[2]), 0.1)
+        prev_pose = np.concatenate([jn.reshape(-1), [tn[0] / z, tn[1] / z, math.log(z)]])
+        return {
+            "prev_pose": torch.from_numpy(prev_pose.astype(np.float32) * has_prev),
+            "has_prev": torch.tensor(has_prev, dtype=torch.float32),
+            "has_pair": torch.tensor(has_pair, dtype=torch.float32),
+            "prev_feet": torch.from_numpy((jn + tn)[FOOT_KP].astype(np.float32)),
+            "feet_disp": torch.from_numpy(disp.astype(np.float32)),
+            "contact": torch.from_numpy(contact),
+            "contact_valid": torch.from_numpy(c_valid),
+            "foot_mocap": torch.from_numpy(fm.astype(np.float32)),
+            "foot_mocap_valid": torch.from_numpy(fm_valid.astype(np.float32)),
+        }
+
     def __len__(self):
         return len(self.pairs)
 
@@ -914,8 +1085,13 @@ class SAM3DStudentDataset(Dataset):
         if self.crop_windows:
             # The tile is K windows side by side, each already at image_size;
             # the chosen one's box replaces bbox_square everywhere below.
-            win = (random.randrange(len(ann["win_boxes"]))
-                   if self.augment and self.window_mode == "random" else 0)
+            win = 0
+            if self.augment and self.window_mode == "random":
+                k = len(ann["win_boxes"])
+                if self.window0_p is None:
+                    win = random.randrange(k)
+                elif random.random() >= self.window0_p:
+                    win = random.randrange(1, k)
             img_pil = img_pil.crop((win * W, 0, (win + 1) * W, H))
             sq_bbox = ann["win_boxes"][win]
         sq_x1, sq_y1 = sq_bbox[0], sq_bbox[1]
@@ -962,6 +1138,7 @@ class SAM3DStudentDataset(Dataset):
             b_scale = b_size / max(orig_w, orig_h)
 
         aug_flip, cos_t, sin_t = 0.0, 1.0, 0.0
+        angle = 0.0
         M_total = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
         aug_active = 0.0
         if self.context_crops:
@@ -1078,7 +1255,10 @@ class SAM3DStudentDataset(Dataset):
             cy_norm = 2.0 * (cy / orig_h) - 1.0
             cliff_cond = torch.tensor([cx_norm, cy_norm, b_scale], dtype=torch.float32)
 
+        extra = ({} if self.temporal is None
+                 else self._temporal_sample(Path(npz_path), ann, aug_flip, angle))
         return {
+            **extra,
             "image": image,                                                          
             "cliff_cond": cliff_cond,                                                
             "mhr_model_params": torch.from_numpy(ann["mhr_model_params"]).float(),   
@@ -1111,7 +1291,8 @@ def build_dataloaders(cfg):
                 context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
                 v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
                 v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows,
-                window_mode=cfg.window_mode)
+                window_mode=cfg.window_mode, window0_p=cfg.window0_p,
+                temporal=temporal_kwargs(cfg))
     full_dataset = SAM3DStudentDataset(
         cfg.data_root,
         augment=cfg.augment,
@@ -1408,6 +1589,27 @@ class InstantHMRStudent(nn.Module):
         nn.init.normal_(self.head_2d_logits.weight, mean=0.0, std=1e-4)
         nn.init.constant_(self.head_2d_logits.bias, 0.0)
 
+        # --prev-token: one query appended AFTER the 71, so indices 0..70 keep
+        # their meaning and a base checkpoint loads into them unchanged. The
+        # projection's last layer starts at zero, so a withheld and a supplied
+        # previous pose start out identical and the fine-tune departs from the
+        # base model's function only as far as one extra query moves it.
+        self.prev_token = bool(getattr(cfg, "prev_token", False))
+        if self.prev_token:
+            self.prev_proj = nn.Sequential(
+                nn.Linear(PREV_DIM, 256), nn.GELU(), nn.Linear(256, cfg.d_model))
+            nn.init.zeros_(self.prev_proj[2].weight)
+            nn.init.zeros_(self.prev_proj[2].bias)
+            self.prev_query = nn.Parameter(torch.randn(1, 1, cfg.d_model) * 0.02)
+            self.prev_mask_embed = nn.Parameter(torch.zeros(1, cfg.d_model))
+        self.contact_head = (nn.Linear(cfg.d_model, 2)
+                             if getattr(cfg, "contact_head", False) else None)
+        if self.contact_head is not None:
+            # Default init gives logits of +-10 on feat_global's scale, a BCE of
+            # 6.3 on a base checkpoint; this starts it at log 2 = 0.69.
+            nn.init.normal_(self.contact_head.weight, mean=0.0, std=1e-4)
+            nn.init.zeros_(self.contact_head.bias)
+
         # Bone-scale bound.  Buffers, not constants, so they survive
         # state_dict round-trips and bake into the ONNX graph; tanh exports.
         self.bound_scales = bool(getattr(cfg, "bound_scales", False))
@@ -1433,18 +1635,26 @@ class InstantHMRStudent(nn.Module):
             self.register_buffer("scale_lo", lo - m)
             self.register_buffer("scale_hi", hi + m)
 
-    def forward(self, images, cliff_cond):
+    def forward(self, images, cliff_cond, prev_pose=None, has_prev=None):
         B = images.shape[0]
         img_feats = self.backbone.forward_features(images)
 
         if img_feats.dim() == 4:
-            img_feats = img_feats.flatten(2).transpose(1, 2)  
+            img_feats = img_feats.flatten(2).transpose(1, 2)
 
         memory = self.feat_proj(img_feats)
         memory = memory + self.mem_pos_embed
         queries = self.query_embed.expand(B, -1, -1)
         cond = self.cond_proj(cliff_cond).unsqueeze(1)
         queries = queries + cond
+        if self.prev_token:
+            # No previous pose given (validation, a first frame) = withheld.
+            if prev_pose is None:
+                prev_pose = cliff_cond.new_zeros(B, PREV_DIM)
+                has_prev = cliff_cond.new_zeros(B)
+            h = has_prev.view(B, 1).to(prev_pose.dtype)
+            tok = h * self.prev_proj(prev_pose) + (1.0 - h) * self.prev_mask_embed
+            queries = torch.cat([queries, self.prev_query + tok.unsqueeze(1) + cond], dim=1)
         shared_feats = self.transformer(tgt=queries, memory=memory)
 
         feat_global = shared_feats[:, 0, :]
@@ -1500,6 +1710,8 @@ class InstantHMRStudent(nn.Module):
             "joints_2d": pred_joints_2d,
             "joints_2d_logits": logits_2d,
         }
+        if self.contact_head is not None:
+            out["contact_logits"] = self.contact_head(feat_global)
         if self.cont_head is not None:
             # Training-only. The deploy wrapper names its four outputs
             # explicitly, so this never reaches the ONNX graph.
@@ -2006,11 +2218,24 @@ class DistillationLoss(nn.Module):
         # "euclid" also has a FLAT gradient (d||x||/dx is a unit vector), so it is
         # gentler than the current form where the error is large -- 0.62x on a
         # freshly initialised model -- and only stronger once the model is close.
+        # Semelle frames with mocap feet: the teacher's foot keypoints leave this
+        # term and loss_foot_mocap supervises them instead (the teacher's feet
+        # slide from frame to frame; the markers do not).
+        mocap_feet = (float(getattr(self.cfg, "w_foot_mocap", 0.0)) > 0.0
+                      and "foot_mocap_valid" in targets)
         if getattr(self.cfg, "kp3d_loss", "smooth_l1") == "euclid":
             e_kp3d = (pred_kp3d - tgt_3d).norm(dim=-1)                # (B, 70), metres
+            w3 = self.kp3d_weight.expand_as(e_kp3d)
+            if mocap_feet:
+                w3 = w3 * (1.0 - targets["foot_mocap_valid"])
             losses['loss_3d_native'] = (
-                self._kp_weighted(e_kp3d, self.kp3d_weight.expand_as(e_kp3d))
+                self._kp_weighted(e_kp3d, w3)
                 * self.cfg.w_keypoints3d * self.fk_scale)
+        elif mocap_feet:
+            e_kp3d = F.smooth_l1_loss(pred_kp3d, tgt_3d, reduction='none').mean(-1)
+            w3 = 1.0 - targets["foot_mocap_valid"]
+            losses['loss_3d_native'] = (self._kp_weighted(e_kp3d, w3)
+                                        * self.cfg.w_keypoints3d * self.fk_scale)
         else:
             losses['loss_3d_native'] = self.l1(pred_kp3d, tgt_3d) * self.cfg.w_keypoints3d * self.fk_scale
 
@@ -2060,14 +2285,49 @@ class DistillationLoss(nn.Module):
         losses['loss_reproj'] = self._kp_weighted(
             e_reproj, w_kp * self.kp3d_weight, m_reproj) * self.cfg.w_reproj * self.fk_scale
 
+        if "contact" in targets:
+            self._foot_lock_losses(losses, preds, targets, pred_kp3d)
+
         losses['total_loss'] = sum(losses.values())
         return losses
+
+    def _foot_lock_losses(self, losses, preds, targets, pred_kp3d):
+        """--prev-token terms. Everything is in the augmented camera frame
+        (keypoints + cam_trans), the frame the dataset moved its labels into.
+
+        loss_zero_vel: on a real pair with the previous pose supplied and the
+        foot in contact, the predicted foot must sit where the previous-pose
+        INPUT put it, plus the foot's true motion between the two frames. At
+        inference that input is the model's own last estimate, so this is what
+        keeps a planted foot planted."""
+        B = pred_kp3d.shape[0]
+        cfg = self.cfg
+        pred_abs = pred_kp3d + preds["cam_trans"].unsqueeze(1)          # (B, 70, 3)
+        cv = targets["contact_valid"]
+        if "contact_logits" in preds and cfg.w_contact > 0:
+            bce = F.binary_cross_entropy_with_logits(
+                preds["contact_logits"].float(), targets["contact"], reduction="none")
+            losses['loss_contact'] = (bce * cv).sum() / cv.sum().clamp_min(1.0) * cfg.w_contact
+        if cfg.w_zero_vel > 0:
+            feet = torch.as_tensor(FOOT_KP, device=pred_kp3d.device)
+            e = ((pred_abs[:, feet] - targets["prev_feet"]) - targets["feet_disp"]).norm(dim=-1)
+            e = e.view(B, 2, 4).mean(-1)                                     # (B, 2) metres
+            m = targets["contact"] * cv * (targets["has_prev"] * targets["has_pair"]).view(B, 1)
+            losses['loss_zero_vel'] = ((e * m).sum() / m.sum().clamp_min(1.0)
+                                       * cfg.w_zero_vel * self.fk_scale)
+        if cfg.w_foot_mocap > 0:
+            fv = targets["foot_mocap_valid"]
+            tgt_abs = targets["foot_mocap"] + targets["cam_trans"].unsqueeze(1)
+            e = (pred_abs - tgt_abs).norm(dim=-1)
+            losses['loss_foot_mocap'] = ((e * fv).sum() / fv.sum().clamp_min(1.0)
+                                         * cfg.w_foot_mocap * self.fk_scale)
 
 # The three terms that back-propagate through the MHR forward kinematics.  They
 # are the only unbounded ones: the parameter regressions are bounded by the
 # target magnitudes and the 2D terms are bounded by construction (SimCC spans
 # +/-kp2d_range and its CE by log(kp2d_bins)).
-FK_LOSS_KEYS = ("loss_3d_native", "loss_mhr_joints", "loss_reproj", "loss_verts")
+FK_LOSS_KEYS = ("loss_3d_native", "loss_mhr_joints", "loss_reproj", "loss_verts",
+                "loss_zero_vel", "loss_foot_mocap")
 
 
 def safe_loss_subset(losses):
@@ -2556,10 +2816,13 @@ class HMRDeployWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, image, cliff_cond):
-        out = self.model(image, cliff_cond)
-        return (out["mhr_params"], out["shape_params"], out["cam_trans"],
+    def forward(self, image, cliff_cond, prev_pose=None, has_prev=None):
+        # A --prev-token graph takes the previous pose as two extra inputs and
+        # returns the per-foot contact logits as a fifth output.
+        out = self.model(image, cliff_cond, prev_pose, has_prev)
+        base = (out["mhr_params"], out["shape_params"], out["cam_trans"],
                 out["joints_2d"])
+        return base + (out["contact_logits"],) if "contact_logits" in out else base
 
 def topological_sort_onnx(model):
     available = set()
