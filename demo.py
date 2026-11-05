@@ -14,7 +14,7 @@ unpacked asset folder (``--mhr-assets``). See ``instanthmr/mhr_renderer.py``.
 
 MHR-only checkpoints
 --------------------
-A model exported from ``train_distill_mhr_only.py`` has FOUR ONNX outputs — it
+A model exported from ``train.py`` has FOUR ONNX outputs — it
 has no 3D coordinate head, so its 70 keypoints are derived from the MHR forward
 pass, exactly like the SAM3D teacher does. Such a model therefore *requires* an
 MHR rig; when none is requested explicitly the demo falls back to
@@ -139,6 +139,13 @@ def parse_args() -> argparse.Namespace:
         help="Processed frames between a prediction and the frame it feeds "
              "(default: 5, as in the benchmarks; the token was trained on pairs "
              "5-20 frames apart).",
+    )
+    p.add_argument(
+        "--contact-threshold", type=float, default=0.5, metavar="P",
+        help="Prev-token models only: a foot is drawn planted when its contact "
+             "probability exceeds P (default: 0.5). On held-out jumps, "
+             "0.8 gets both feet off in 92%% of flight frames instead of 83%%, "
+             "and keeps 98%% (instead of 99%%) of both-planted frames.",
     )
     p.add_argument(
         "--smoothing-filter", action="store_true",
@@ -297,7 +304,7 @@ def build_mhr(args: argparse.Namespace, required: bool = False):
             sys.stderr.write(
                 f"\n[error] MHR TorchScript rig not found: {path}\n"
                 "        This is the ~700 MB mhr_model.pt the distillation loads with\n"
-                "        torch.jit.load; see instanthmr_distill_train/checkpoints/README.md.\n"
+                "        torch.jit.load; see training/checkpoints/README.md.\n"
                 "        Alternatively use --mhr-assets with the unpacked MHR asset folder.\n\n"
             )
             sys.exit(1)
@@ -365,6 +372,7 @@ def build_all(args: argparse.Namespace):
         mhr_renderer=mhr,
         mesh_alpha=args.mesh_alpha,
         reference=build_reference(args),
+        contact_threshold=args.contact_threshold,
     )
     return pipeline, viz, mhr
 

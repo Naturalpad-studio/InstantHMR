@@ -6,11 +6,11 @@ InstantHMR and runs a forward pass through Meta's MHR body model to obtain
   * the full body **mesh** (skinned vertices), and
   * the 70 native **keypoints**, regressed from the 127 skeleton joints.
 
-The keypoints matter because ``train_distill_mhr_only.py`` deletes the
+The keypoints matter because ``train.py`` deletes the
 student's 3D coordinate head: its ONNX graph has four outputs instead of five
 and the 3D pose must be derived here, exactly the way the teacher derives it
 from the mesh.  The (70, 127) affine map lives in
-``instanthmr_distill_train/assets/mhr_j127_to_kp70.npy`` and was fitted against
+``training/assets/mhr_j127_to_kp70.npy`` and was fitted against
 the teacher's own labels (held-out residual: 1.36 mm mean).
 
 Two interchangeable backends
@@ -57,7 +57,7 @@ import numpy as np
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: (70, 127) affine map from MHR skeleton joints to the 70 native keypoints.
-DEFAULT_KP_REGRESSOR = _REPO_ROOT / "instanthmr_distill_train/assets/mhr_j127_to_kp70.npy"
+DEFAULT_KP_REGRESSOR = _REPO_ROOT / "training/assets/mhr_j127_to_kp70.npy"
 #: TorchScript rig shipped with the training code.
 DEFAULT_MHR_SCRIPT = _REPO_ROOT / "checkpoints/mhr_model.pt"
 
@@ -141,7 +141,7 @@ class _MHRBase:
         """Raw MHR (centimetres, Y-up / Z-back) -> InstantHMR (metres, Y-down / Z-forward).
 
         Negating both Y and Z keeps the frame right-handed after the Y flip.
-        This is the exact transform ``train_distill_mhr_only.MHRForwardPass``
+        This is the exact transform ``train.MHRForwardPass``
         applies before the keypoint regression, so student and demo agree.
         """
         out = xyz / 100.0
@@ -180,7 +180,7 @@ class _MHRBase:
             raise RuntimeError(
                 f"no MHR keypoint regressor loaded (looked for {DEFAULT_KP_REGRESSOR}).\n"
                 "It ships with the training code; regenerate it with\n"
-                "  python instanthmr_distill_train/train_distill_mhr_only.py --fit-regressor"
+                "  python training/train.py --fit-regressor"
             )
         torch = self._torch
         pose, squeeze = self._as_batch(mhr_params, NUM_MODEL_PARAMS)

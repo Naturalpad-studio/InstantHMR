@@ -13,8 +13,8 @@ Of the 39,665 people in sam3d_gt_coco: 4 -> 6,396, 5 -> 3,537, 6 -> 1,980,
 legal choice; --licenses makes it explicit and it is recorded in the output.
 
     python datasets_pipeline/coco_license_subset.py \
-        --src $SCRATCH/instanthmr/data_win288/sam3d_gt_coco \
-        --out $SCRATCH/instanthmr/data_win288_com/sam3d_gt_cococom --licenses 4,7
+        --src data_win288/sam3d_gt_coco \
+        --out data_win288_com/sam3d_gt_cococom --licenses 4,7
 
 The output is a normal split folder (annotations/, body_crops/, images ->
 body_crops), so it sits in a data root beside other splits and needs its own
@@ -58,7 +58,7 @@ def main() -> None:
     (args.out / "body_crops").mkdir()
     os.symlink("body_crops", args.out / "images")
 
-    # One directory listing, not one glob per person: on Lustre each glob re-reads
+    # One directory listing, not one glob per person: on a network filesystem each glob re-reads
     # the whole 40k-entry folder.
     crop_of = {e.name.rsplit(".", 1)[0]: e.path for e in os.scandir(crops)}
     kept = dropped = 0

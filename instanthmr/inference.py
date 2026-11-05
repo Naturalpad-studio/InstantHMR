@@ -13,10 +13,10 @@ into full-frame pixels.
 Two graph layouts are supported, and the session tells them apart by itself:
 
   * **5 outputs** ``(mhr_params, shape_params, cam_trans, joints_2d, joints_3d)``
-    — the student has its own 3D coordinate head (``train_distill.py`` and the
-    optimized / correctives scripts).
+    — older students with their own 3D coordinate head (earlier trainers,
+    not in this repository).
   * **4 outputs** ``(mhr_params, shape_params, cam_trans, joints_2d)`` — the
-    MHR-only student (``train_distill_mhr_only.py``) has no 3D head, exactly
+    MHR-only student (``train.py``) has no 3D head, exactly
     like the SAM3D teacher. Its 70 keypoints are derived here by running the
     MHR skeleton forward on the predicted parameters, so such a model needs an
     MHR backend (see :mod:`instanthmr.mhr_renderer`) passed as ``mhr=``.
@@ -268,7 +268,7 @@ class InstantHMR:
     def _joints_3d(self, mhr_params: np.ndarray, shape_params: np.ndarray) -> np.ndarray:
         """Regress the 70 keypoints from predicted MHR parameters.
 
-        Mirrors ``train_distill_mhr_only.MHRForwardPass.get_native_keypoints``:
+        Mirrors ``train.MHRForwardPass.get_native_keypoints``:
         skeleton forward, cm -> m, Y/Z flip, then the (70, 127) affine map. The
         student was trained through exactly this operator, so any other
         keypoint definition would silently shift the predictions.
@@ -276,7 +276,7 @@ class InstantHMR:
         if self._mhr is None:
             raise RuntimeError(
                 "this ONNX graph has no 'joints_3d' output — it comes from "
-                "train_distill_mhr_only.py, where the 3D keypoints are derived from "
+                "train.py, where the 3D keypoints are derived from "
                 "the MHR forward pass.\n"
                 "Pass an MHR backend, e.g.\n"
                 "    from instanthmr.mhr_renderer import build_mhr\n"
@@ -498,7 +498,7 @@ class InstantHMR:
 
         # CLIFF conditioning vector (full-frame coords). Must match the variant
         # the checkpoint was TRAINED with -- see `cliff_focal` in
-        # instanthmr_distill_train/train_distill_mhr_only.py. A model trained
+        # training/train.py. A model trained
         # with the focal-aware form and run with the pixel form (or the other
         # way round) does not error; it silently mis-places the person in depth.
         if self.cliff_focal:

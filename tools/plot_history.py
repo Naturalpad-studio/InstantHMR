@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Plot the per-epoch curves in one or more runs' `history.jsonl`.
 
-    python tools/plot_history.py instanthmr_distill_train/runs/g6bv_s
+    python tools/plot_history.py training/runs/g6bv_s
     python tools/plot_history.py .../g6bv_s .../g6vv_s -o /tmp/gen6.png
     python tools/plot_history.py $RUNS_DIR/g6*_s --tail 60
 
-`summarize_runs.py` answers "which run is ahead". This answers "is it still
-going down, and is it healthy" — the question you have to settle before
-resubmitting a chained run for more epochs.
+This answers "is it still going down, and is it healthy" — the question you
+have to settle before relaunching a run for more epochs.
 
 Six panels:
 
@@ -29,7 +28,7 @@ Six panels:
                  Ratio below 1 means the average is ahead of the raw weights,
                  which is the normal state. A spike above 1 is the cheapest
                  detector there is for an intra-epoch excursion the loss guard
-                 never saw — see docs/todo.md item 5b.
+                 never saw.
 """
 
 from __future__ import annotations
@@ -50,8 +49,8 @@ ROLLBACK_SKIPS = 50
 def find_history(p: Path) -> Path | None:
     """history.jsonl for a run, whether given the run dir or its parent.
 
-    52_train_ddp.slurm writes to $RUNS_DIR/<name>, and train_distill_jz.py
-    creates <name>/ again underneath, so the file usually sits one level deeper
+    A launcher that writes to $RUNS_DIR/<name> while train_ddp.py
+    creates <name>/ again underneath leaves so the file usually sits one level deeper
     than the directory you name on the command line.
     """
     if p.is_file():

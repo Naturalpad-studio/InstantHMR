@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build `instanthmr_distill_train/assets/mhr_cont_head.npz` for `--cont-head`.
+"""Build `training/assets/mhr_cont_head.npz` for `--cont-head`.
 
     python tools/build_cont_head_assets.py --data_root data
 
@@ -81,7 +81,7 @@ def main():
     ap.add_argument("--teacher-ckpt", type=Path, default=None)
     ap.add_argument("--limit", type=int, default=20000)
     ap.add_argument("--out", type=Path,
-                    default=Path("instanthmr_distill_train/assets/mhr_cont_head.npz"))
+                    default=Path("training/assets/mhr_cont_head.npz"))
     args = ap.parse_args()
 
     buf = teacher_buffers(args.teacher_ckpt)

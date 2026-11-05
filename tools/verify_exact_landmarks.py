@@ -37,8 +37,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "instanthmr_distill_train"))
-import train_distill_mhr_only as T                             # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training"))
+import train as T                             # noqa: E402
 
 OK, BAD = "  ok  ", "*FAIL*"
 _fails = 0

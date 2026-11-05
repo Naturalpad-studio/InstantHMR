@@ -205,7 +205,7 @@ def main() -> None:
                         "whether a hand clears --hand-min-px")
     p.add_argument("--mhr", type=Path, default=REPO / "checkpoints" / "mhr_model.pt")
     p.add_argument("--regressor", type=Path,
-                   default=REPO / "instanthmr_distill_train" / "assets" / "mhr_j127_to_kp70.npy")
+                   default=REPO / "training" / "assets" / "mhr_j127_to_kp70.npy")
     args = p.parse_args()
     for d in args.annotation_dir:
         if args.list_groups:

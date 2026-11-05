@@ -2,7 +2,7 @@
 """
 Convert the official ``facebook/sam-3d-body-dataset`` parquet annotations into the
 per-crop ``images/*.png`` + ``annotations/*.npz`` layout consumed by
-``notebooks/distill_transformer_decoder.ipynb``.
+``training/train.py``.
 
 This lets you train InstantHMR directly on the original SAM 3D Body ground-truth
 MHR fits, instead of (or alongside) the teacher-distilled pseudo-labels produced

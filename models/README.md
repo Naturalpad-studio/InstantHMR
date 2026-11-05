@@ -41,8 +41,7 @@ repository: <https://github.com/mohamdev/InstantHMR>.
 
 Most users only need `instanthmr.onnx`. The `.pth` is included for people
 who want to continue training, swap the head, or re-export with different
-options — see [`docs/training.md`](https://github.com/mohamdev/InstantHMR/blob/main/docs/training.md)
-in the main repo.
+options — see [`training/README.md`](../training/README.md).
 
 ## ONNX I/O
 

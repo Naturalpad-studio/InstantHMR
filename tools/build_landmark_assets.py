@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build `instanthmr_distill_train/assets/mhr_landmarks70.npz` for `--exact-landmarks`.
+"""Build `training/assets/mhr_landmarks70.npz` for `--exact-landmarks`.
 
     python tools/build_landmark_assets.py
 
@@ -48,7 +48,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--teacher-ckpt", type=Path, default=None)
     ap.add_argument("--out", type=Path,
-                    default=Path("instanthmr_distill_train/assets/mhr_landmarks70.npz"))
+                    default=Path("training/assets/mhr_landmarks70.npz"))
     args = ap.parse_args()
 
     ckpt = args.teacher_ckpt

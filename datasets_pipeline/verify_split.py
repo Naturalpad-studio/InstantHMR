@@ -81,7 +81,7 @@ def structure(d: Path, workers: int = 16, hand_scan_limit: int = 300_000,
     orphan_body = sorted(body - stems)[:5]
 
     # Reading every npz is the expensive half of this check: single-threaded it
-    # runs at ~100/s on Lustre, so a 3.4M-crop split would take 9 h. Sample
+    # runs at ~100/s on a network filesystem, so a 3.4M-crop split would take 9 h. Sample
     # above hand_scan_limit and scale, and thread the reads either way.
     scan = anns
     scaled = False
@@ -207,7 +207,7 @@ def main() -> None:
     p.add_argument("--mhr", type=Path,
                    default=REPO / "checkpoints" / "mhr_model.pt")
     p.add_argument("--regressor", type=Path,
-                   default=REPO / "instanthmr_distill_train" / "assets" / "mhr_j127_to_kp70.npy")
+                   default=REPO / "training" / "assets" / "mhr_j127_to_kp70.npy")
     args = p.parse_args()
 
     if not (args.dir / "annotations").is_dir():

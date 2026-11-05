@@ -18,7 +18,7 @@ Logs, per frame:
   - ``timing/total_ms``     : scalar plot of full pipeline latency.
   - ``timing/fps``          : scalar plot of effective frames-per-second.
   - ``contact/person_N/{left,right}``: per-foot contact probability, and the
-                              feet drawn red while planted (> 0.5), for a
+                              feet drawn red while planted (> contact_threshold), for a
                               prev-token graph that has a contact head.
 
 ``rr.init(..., spawn=True)`` is called automatically so the viewer opens
@@ -88,6 +88,7 @@ class RerunVisualizer:
         mhr_renderer: "MHRRenderer | None" = None,
         mesh_alpha: float = MESH_ALPHA,
         reference=None,
+        contact_threshold: float = 0.5,
     ):
         import rerun as rr
 
@@ -103,6 +104,7 @@ class RerunVisualizer:
             int(round(255 * min(max(mesh_alpha, 0.0), 1.0))),
         )
         self._prev_num_ref = 0
+        self.contact_threshold = contact_threshold
         rr.init(application_id, spawn=spawn_viewer)
 
         # SAM3D / MHR convention: right-handed, Y-down camera frame.
@@ -196,6 +198,7 @@ class RerunVisualizer:
 
         annotated = self._draw_overlay(
             image_rgb, persons, detector_ms, hmr_ms, render_ms, total_ms,
+            self.contact_threshold,
         )
         rr.log("camera/image", rr.Image(annotated))
 
@@ -257,7 +260,7 @@ class RerunVisualizer:
 
         if person.contact_prob is not None:
             for name, kp, prob in zip(FOOT_NAMES, FOOT_KP, person.contact_prob):
-                planted = prob > 0.5
+                planted = prob > self.contact_threshold
                 rr.log(f"{path}/feet/{name}", rr.Points3D(
                     positions=joints[list(kp)], radii=0.03 if planted else 0.015,
                     colors=[PLANTED_COLOR if planted else FREE_COLOR]))
@@ -343,6 +346,7 @@ class RerunVisualizer:
         hmr_ms: Optional[float],
         render_ms: float,
         total_ms: Optional[float],
+        contact_threshold: float = 0.5,
     ) -> np.ndarray:
         """Draw per-person bbox + 2D skeleton + a timing HUD onto the frame."""
         out = image_rgb.copy()
@@ -378,7 +382,7 @@ class RerunVisualizer:
             if person.contact_prob is not None:
                 r = max(4, int(round(0.012 * max(h, w))))
                 for name, kp, prob in zip(FOOT_NAMES, FOOT_KP, person.contact_prob):
-                    planted = prob > 0.5
+                    planted = prob > contact_threshold
                     for k in kp:
                         if valid[k]:
                             cv2.circle(out, tuple(j2d[k].astype(int)), r,

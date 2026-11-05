@@ -135,7 +135,7 @@ $THREEDPW_IMG_DIR/outdoors_climbing_01/image_00386.jpg
 
 You need `imageFiles.zip` only. `sequenceFiles.zip` holds the original SMPL
 ground truth, which this pipeline never reads — the MHR fits come from the
-parquet. Keep it for the 3DPW *benchmark* (`benchmark/eval_3dpw.py`), not for
+parquet. Keep it for the 3DPW ground truth (`benchmark/make_3dpw_gt.py`), not for
 training data.
 
 Same command, `--split 3dpw_train`. Both are small enough for
@@ -224,7 +224,7 @@ predicted hand keypoint to the top-left of the frame.
 a hand crop unless all 21 of that hand's keypoints are visible (true for 0.3% of
 SA-1B hands and 100% of every other split).
 
-`train_distill_mhr_only.py` consumes the mask: `loss_2d_native`,
+`train.py` consumes the mask: `loss_2d_native`,
 `loss_2d_simcc` and `loss_reproj` are weighted by `joints_2d_vis`, which
 defaults to all-ones when a folder does not carry it — so every existing
 `data/sam3d_gt_*` folder trains exactly as before (verified to float32

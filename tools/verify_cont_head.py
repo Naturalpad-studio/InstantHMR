@@ -21,8 +21,7 @@ Six checks, all on real ground truth and the real rig:
    random poses, and at the two places the geometry is singular: identity and a
    half turn.
 5. **Root-loss magnitude.** The chordal rotation loss replaces a SmoothL1 on the
-   Euler triple. `docs/todo.md` asks for the gradient comparison explicitly, so
-   it is printed rather than assumed.
+   Euler triple. The gradient comparison is printed rather than assumed.
 6. **Scale stability** under a large random head output: the failure mode that
    killed four runs at epochs 24-32 was a bone scale running away, and the PCA
    parameterisation changes how that can happen.
@@ -40,9 +39,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "instanthmr_distill_train"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training"))
 import mhr_cont as MC                                          # noqa: E402
-import train_distill_mhr_only as T                             # noqa: E402
+import train as T                             # noqa: E402
 
 OK, BAD = "  ok  ", "*FAIL*"
 _fails = 0
@@ -224,7 +223,7 @@ def main() -> int:
               f"loss {e.mean():.4f}, max |grad| {six.grad.abs().max():.3e}")
 
     # --- 5. root-loss magnitude vs the SmoothL1 it replaces -----------------
-    print("\nroot-loss magnitude (docs/todo.md asks for this explicitly):")
+    print("\nroot-loss magnitude:")
     err_deg = [1.0, 5.0, 30.0, 90.0, 179.0]
     print(f"  {'error':>10} | {'chordal /6':>10} | {'SmoothL1(beta=1) on the Euler triple':>38}")
     for d in err_deg:

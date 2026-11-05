@@ -48,8 +48,8 @@ A non-default --context requires an explicit --output-dir, and the builder
 refuses to add crops of one kind to a folder holding the other, so a context
 corpus can never silently mix with a standard one.
 
-Verified by `tools/verify_context_crops.py` on 200 AIC rows: default output
-byte-identical to HEAD; the 1.2x window cut back out of a 2.0x / 448 crop
+Verified on 200 AIC rows: default output byte-identical to the standard
+crop; the 1.2x window cut back out of a 2.0x / 448 crop
 matches today's 224 crop at 42.2 dB mean (sigma-1 blur, padding masked) with
 a 0.09 px shift. At 2.0x, 195 of 200 AIC squares reach past the frame edge.
 
@@ -57,7 +57,7 @@ a 0.09 px shift. At 2.0x, 195 of 200 AIC squares reach past the frame edge.
 v4 preset): K square windows per person, each cut from the full-resolution
 photo with ONE resize -- the same operation as the runtime crop, so the training
 texture is the deployment texture (a 448 px context crop plus a second warp
-was not: STATUS.md 2026-10-21). Window 0 is the 1.2x square of the tight box
+was not). Window 0 is the 1.2x square of the tight box
 with the RUNTIME's rounding (floor / ceil, instanthmr/inference.py), i.e. the
 crop the phone cuts for a perfect detector box -- within 1 px of bbox_square,
 whose int() edges the runtime does not use; windows 1..K-1 are v3 framings (side log-uniform in
@@ -109,7 +109,7 @@ from tools.parquet_to_npz import (  # noqa: E402
 
 # MHR70 keypoint blocks. Index 41 is right_wrist, 62 is left_wrist; each hand
 # block is its 20 finger joints plus that wrist. Taken from JOINT_NAMES in
-# instanthmr_distill_train/train_distill_mhr_only.py.
+# training/train.py.
 RIGHT_HAND_KPS = list(range(21, 42))
 LEFT_HAND_KPS = list(range(42, 63))
 
@@ -330,7 +330,7 @@ def main() -> None:
             sys.exit("--windows needs K >= 2, the default --context and --no-hands")
         if args.output_dir is None or "{size}" not in str(args.output_dir):
             sys.exit("--windows needs an --output-dir containing {size}, e.g. "
-                     "$SCRATCH/instanthmr/data_win{size}/sam3d_gt_aic")
+                     "data_win{size}/sam3d_gt_aic")
         out_dirs = [Path(str(args.output_dir).format(size=s)) for s in win_sizes]
     else:
         out_dirs = [out_dir]
@@ -430,7 +430,7 @@ def main() -> None:
                 # a few entries keep every photo decoded once. Unbounded, the
                 # cache held every decoded frame of the shard -- ~10 MB each on
                 # SA-1B -- and 10 builder processes per job ran out of memory
-                # after ~40 min (Jean Zay 2026-10-04, OUT_OF_MEMORY).
+                # after ~40 min.
                 if len(img_cache) >= 8:
                     img_cache.clear()
                 bgr = cv2.imread(str(args.image_dir / relpath))

@@ -318,8 +318,7 @@ via `--model`.
 
 InstantHMR can be trained from two different label sources. **Both produce the
 exact same `images/*.png` + `annotations/*.npz` layout** that
-[`notebooks/distill_transformer_decoder.ipynb`](notebooks/distill_transformer_decoder.ipynb)
-consumes, so the training notebook is identical either way:
+[`training/`](training/README.md) consumes, so training is identical either way:
 
 1. **Released ground-truth annotations — this is what every shipped model uses.**
    Train directly on
@@ -327,8 +326,8 @@ consumes, so the training notebook is identical either way:
    — the human MHR fits used to build SAM 3D Body — converted to the `.npz`
    schema by [`tools/parquet_to_npz.py`](tools/parquet_to_npz.py) and laid out
    by [`datasets_pipeline/build_split.py`](datasets_pipeline/build_split.py)
-   into `data/sam3d_gt_<dataset>/`. The cluster corpus is entirely of this kind
-   (sa1b / aic / harmony4d / coco / mpii).
+   into `data/sam3d_gt_<dataset>/`. The released models were trained only on
+   this kind (sa1b / aic / harmony4d / coco / mpii).
 2. **Teacher distillation — an option, not the default.** Run
    `facebook/sam-3d-body-dinov3` over your own images with
    [`tools/annotate_dataset.py`](tools/annotate_dataset.py) to generate
@@ -337,9 +336,9 @@ consumes, so the training notebook is identical either way:
    imagery the released dataset does not cover; note that it caps the student at
    the teacher's own accuracy, which training on the ground truth does not.
 
-The trainer entry points and the `data/sam3d_distill_mix` directory keep
-"distill" in their names for historical reasons. The name does **not** mean the
-labels are teacher inference — only `tools/annotate_dataset.py` produces those.
+The `data/sam3d_distill_mix` directory keeps "distill" in its name for
+historical reasons. The name does **not** mean the labels are teacher inference —
+only `tools/annotate_dataset.py` produces those.
 
 ### Train on the original annotations (COCO example)
 
@@ -368,9 +367,8 @@ python tools/parquet_to_npz.py \
     --output_dir     data/sam3d_gt_coco \
     --validate
 
-# 4. Point the notebook's config at the output and train:
-#    cfg.images_dir      = "data/sam3d_gt_coco/images"
-#    cfg.annotations_dir = "data/sam3d_gt_coco/annotations"
+# 4. Train on it (see training/README.md for the released models' settings):
+python training/train_ddp.py --data_root data --output_dir runs/coco
 ```
 
 The converter recovers `cam_trans` from the MHR params, derives the 1.2× square
@@ -430,17 +428,14 @@ python tools/parquet_to_npz.py --annotation_dir $ANN_DIR/egohumans_train \
 > live in the [dataset setup guides](https://github.com/facebookresearch/sam-3d-body/tree/main/data).
 
 To train on several datasets at once, convert each into its own
-`data/sam3d_gt_<name>/` and either point the notebook at one of them or merge the
-`images/` + `annotations/` folders into a single directory — the filenames are
-prefixed per dataset, so they never collide.
+`data/sam3d_gt_<name>/` under the same `--data_root`; `train_ddp.py --mix` sets
+how often each one is sampled.
 
 ## Documentation
 
-- **[`docs/architecture.md`](docs/architecture.md)** — network design
-  (RepViT backbone, 9-query decoder, CLIFF condition).
+- **[`training/README.md`](training/README.md)** — training and ONNX export.
 - **[`docs/annotation.md`](docs/annotation.md)** — training data generation
   with the SAM3D teacher.
-- **[`docs/training.md`](docs/training.md)** — training and ONNX export.
 
 ## License
 

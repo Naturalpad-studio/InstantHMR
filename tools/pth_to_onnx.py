@@ -11,33 +11,20 @@ Cell 15, so the graph I/O matches ``instanthmr/inference.py``:
              size (224 unless trained with --image-size), stamped as image_size
     outputs: mhr_params, shape_params, cam_trans, joints_2d[, joints_3d]
 
-Architecture selection
-----------------------
-The student head changed twice across training scripts:
-
-  * ``train_distill.py`` regresses 2D joints directly (``head_2d_xy``);
-  * the optimized / correctives scripts predict them with a SimCC
-    classification head (``head_2d_logits`` + ``kp2d_bin_centers``);
-  * ``train_distill_mhr_only.py`` additionally **deletes the 3D head**
-    (``head_3d``) — the 70 keypoints are derived from the MHR forward pass by
-    the consumer, so its graph has FOUR outputs instead of five.
-
-Exporting a SimCC checkpoint through the old architecture silently leaves
-``head_2d_xy`` at its near-zero init, which collapses every 2D keypoint onto
-the centre of the bbox. ``--arch auto`` (the default) picks the right module by
-inspecting the checkpoint, and a missing-key check makes any future mismatch a
-hard error instead of a silent one. The output list is read off the deploy
-wrapper itself, so a 4- vs 5-output graph never has to be configured by hand.
+Architecture
+------------
+Only checkpoints of ``training/train.py`` are supported: a SimCC 2D head
+(``head_2d_logits``) and no 3D head, since the 70 keypoints come from the MHR
+forward pass, so the graph has FOUR outputs. Checkpoints of the earlier
+trainers (a ``head_3d`` or a ``head_2d_xy`` head) are rejected with an error:
+exporting them through this architecture would silently leave a head at its
+initial weights. A missing-key check makes any other mismatch a hard error.
 
 Usage
 -----
-    # default: convert the EMA checkpoint -> models/instanthmr.onnx
-    python tools/pth_to_onnx.py
-
-    # or point at a specific checkpoint / output
-    python ./tools/pth_to_onnx.py \
-        --ckpt   ./instanthmr_distill_train/runs/g8h_lr1x_e600/g8h_lr1x_e600/best_student_model_v3.pth \
-        --output ./models/instanthmr_g8h_lr1x_e600.onnx
+    python tools/pth_to_onnx.py \
+        --ckpt   training/runs/<run>/best_student_model_v3.pth \
+        --output models/instanthmr_<run>.onnx
 """
 import argparse
 import importlib
@@ -47,17 +34,14 @@ from pathlib import Path
 import torch
 
 REPO = Path(__file__).resolve().parent.parent
-TRAIN_DIR = REPO / "instanthmr_distill_train"
+TRAIN_DIR = REPO / "training"
 
 # The model class + deploy wrapper live in the standalone training scripts.
 sys.path.insert(0, str(TRAIN_DIR))
 
 # arch name -> training module that defines the matching InstantHMRStudent.
 ARCH_MODULES = {
-    "mhr_only": "train_distill_mhr_only",                  # SimCC 2D head, NO 3D head
-    "correctives": "train_distill_optimized_correctives",  # SimCC 2D head (head_2d_logits)
-    "optimized": "train_distill_optimized",                # SimCC 2D head, identical weights
-    "legacy": "train_distill",                             # direct 2D regression (head_2d_xy)
+    "mhr_only": "train",                  # SimCC 2D head, NO 3D head
 }
 
 # Canonical ONNX output order. The MHR-only graph stops after `joints_2d`.
@@ -70,32 +54,24 @@ def detect_arch(state: dict) -> str:
     has_simcc = "head_2d_logits.weight" in state
 
     if has_simcc and not has_3d:
-        # train_distill_mhr_only.py: the 3D coordinate head was removed and the
+        # train.py: the 3D coordinate head was removed and the
         # decoder shrank from 141 to 71 queries.
         return "mhr_only"
-    if has_simcc:
-        # `optimized` and `correctives` share identical parameters (they differ
-        # only by an fp32 softmax cast), so either module loads such a
-        # checkpoint; prefer the newer one.
-        return "correctives"
-    if "head_2d_xy.0.weight" in state:
-        return "legacy"
+    if has_3d or "head_2d_xy.0.weight" in state:
+        raise SystemExit(
+            "[error] this checkpoint comes from an earlier trainer (it has a 'head_3d' or "
+            "'head_2d_xy' head), which this release does not include.")
     raise SystemExit(
-        "[error] cannot infer architecture: checkpoint has neither "
-        "'head_2d_logits.weight' nor 'head_2d_xy.0.weight'. Pass --arch explicitly."
-    )
+        "[error] cannot infer architecture: checkpoint has no 'head_2d_logits.weight'.")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--ckpt", type=Path,
-                    default=TRAIN_DIR / "runs/distill_optimized_v2/best_student_model_ema.pth",
-                    help="Path to the .pth checkpoint (default: the EMA checkpoint).")
+    ap.add_argument("--ckpt", type=Path, required=True,
+                    help="Path to the .pth checkpoint written by training/train.py or train_ddp.py.")
     ap.add_argument("--output", type=Path, default=REPO / "models" / "instanthmr.onnx",
                     help="Where to write the ONNX (default: models/instanthmr.onnx).")
-    ap.add_argument("--arch", choices=["auto", *ARCH_MODULES], default="auto",
-                    help="Student architecture / training module (default: auto-detect).")
     ap.add_argument("--allow-missing", action="store_true",
                     help="Export even if checkpoint weights are missing (NOT recommended).")
     ap.add_argument("--opset", type=int, default=17)
@@ -117,7 +93,7 @@ def main() -> None:
     state = ckpt.get("model_state_dict", ckpt)
     state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}  # strip torch.compile prefix
 
-    arch = detect_arch(state) if args.arch == "auto" else args.arch
+    arch = detect_arch(state)
     T = importlib.import_module(ARCH_MODULES[arch])
     print(f"Architecture: {arch}  (from {ARCH_MODULES[arch]}.py)")
 
@@ -126,11 +102,7 @@ def main() -> None:
     # parameters inside forward(); exporting without it leaves the head's raw
     # pre-tanh numbers to be read as bone scales, which is 21.0 mm MPJPE /
     # 14.4 mm PA-MPJPE of silent corruption. See T.config_from_checkpoint.
-    if hasattr(T, "config_from_checkpoint"):
-        cfg, prov = T.config_from_checkpoint(
-            state, args.ckpt, cliff_focal=args.cliff_focal)
-    else:                            # older training modules predate the helper
-        cfg, prov = T.DistillConfig(), {}
+    cfg, prov = T.config_from_checkpoint(state, args.ckpt, cliff_focal=args.cliff_focal)
     print(f"  bound_scales : {getattr(cfg, 'bound_scales', False)} "
           f"({prov.get('bound_scales', 'default')})")
     print(f"  cliff_focal  : {getattr(cfg, 'cliff_focal', False)} "
@@ -167,9 +139,8 @@ def main() -> None:
             sys.exit(
                 f"\n[error] {len(missing)} parameter(s) had no weights in the checkpoint, so they "
                 f"would be exported at random init.\n"
-                f"        This usually means --arch is wrong for this checkpoint "
-                f"(detected: {arch}).\n"
-                f"        Re-run with the right --arch, or --allow-missing to force it."
+                f"        This usually means the checkpoint does not match training/train.py's\n"
+                f"        model. --allow-missing forces the export."
             )
 
     deploy = T.HMRDeployWrapper(model).eval()
@@ -187,7 +158,7 @@ def main() -> None:
     print(f"  prev_token   : {prev_token}")
 
     # Ask the wrapper how many tensors it returns instead of hard-coding five:
-    # train_distill_mhr_only.py drops `joints_3d` from the tuple.
+    # train.py drops `joints_3d` from the tuple.
     with torch.no_grad():
         n_out = len(deploy(*inputs))
     if n_out not in (4, 5):
@@ -263,7 +234,7 @@ def main() -> None:
         if j2d.std() < 0.01:
             print(f"\n[warning] joints_2d std is {j2d.std():.5f} — the 2D keypoints are collapsed "
                   f"onto the crop centre.\n          The exported 2D head is almost certainly "
-                  f"untrained (wrong --arch?).")
+                  f"untrained.")
     except Exception as e:  # noqa: BLE001
         print(f"  (onnxruntime sanity check skipped: {e})")
 

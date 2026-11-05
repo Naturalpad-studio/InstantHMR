@@ -49,7 +49,7 @@ runs/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
-competitors/
+/competitors/
 *.png
 
 # Saved teacher runs for `demo.py --show-reference` (renders + packed .npz).

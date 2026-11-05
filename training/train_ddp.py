@@ -1,0 +1,1570 @@
+#!/usr/bin/env python3
+"""Multi-GPU (DDP) training of InstantHMR.
+
+This is a thin driver around ``train.py``: it imports the config, dataset,
+model, loss and metrics from there rather than copying them, so a change to the
+model or a loss is made once. What lives here is what the single-GPU script
+cannot do.
+
+**1. DistributedDataParallel.** Ranks come from torchrun (``RANK`` /
+``LOCAL_RANK`` / ``WORLD_SIZE``) or, under Slurm's ``srun``, from
+``SLURM_PROCID`` / ``SLURM_LOCALID`` / ``SLURM_NTASKS``. Without a launcher it
+runs as a single process.
+
+**2. Mixture control instead of caps.** SA-1B is 3.40 M of the 3.74 M crops —
+91% of the corpus — so uniform sampling trains almost exclusively on it. A
+:class:`DistributedWeightedSampler` draws with replacement from per-dataset
+weights, so every crop stays reachable and the mixture is a knob (``--mix``).
+Default is weight proportional to sqrt(count), which pulls SA-1B from 91% to
+~69% while keeping COCO and MPII visible.
+
+**3. Epochs decoupled from corpus size.** ``--samples-per-epoch`` fixes the
+epoch length, so "epoch" means a checkpoint interval rather than "one pass over
+3.74 M crops". Size it so an epoch is 30-60 min and a preemption costs at most
+that.
+
+**4. Resume by relaunching.** Every epoch writes ``last.pth`` atomically with
+the *full* state — model, EMA, optimiser, scaler, scheduler, RNG, epoch, best
+metrics. Relaunching the same command picks it up. Note this differs from the
+single-GPU script, which resumes from ``best_student_model_v3.pth`` and so
+discards every epoch since the last improvement.
+
+``InstantHMRStudent(pretrained=True)`` pulls timm weights from Hugging Face. On
+machines without internet access, run ``--warm-cache`` once where there is
+access to populate ``$TORCH_HOME`` / ``$HF_HOME``.
+
+    # 4 GPUs on one machine
+    torchrun --standalone --nproc_per_node=4 training/train_ddp.py \
+        --data_root data --output_dir runs/my_run
+
+See ``training/README.md`` for the settings of the released models.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import math
+import os
+import pickle
+import random
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import torch.optim as optim
+import torch.optim.lr_scheduler as lr_scheduler
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.swa_utils import AveragedModel
+from torch.utils.data import DataLoader, Sampler
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import train as T  # noqa: E402  (sets up matplotlib/ort at import)
+
+
+# ============================================================
+# Distributed plumbing
+# ============================================================
+def ranks_from_env(env) -> tuple[int, int, int]:
+    """``(rank, local_rank, world_size)`` from the launcher's environment.
+
+    torchrun sets ``RANK`` / ``LOCAL_RANK`` / ``WORLD_SIZE``; Slurm's ``srun``
+    sets ``SLURM_PROCID`` / ``SLURM_LOCALID`` / ``SLURM_NTASKS``. torchrun is
+    read first, because when it runs inside a Slurm allocation the Slurm
+    variables describe the allocation, not the ranks. A world of one, or no
+    launcher at all, is a single process.
+    """
+    if "WORLD_SIZE" in env:
+        if int(env["WORLD_SIZE"]) > 1:
+            return int(env["RANK"]), int(env["LOCAL_RANK"]), int(env["WORLD_SIZE"])
+        return 0, 0, 1
+    if int(env.get("SLURM_NTASKS", 1)) > 1 and "SLURM_PROCID" in env:
+        return int(env["SLURM_PROCID"]), int(env["SLURM_LOCALID"]), int(env["SLURM_NTASKS"])
+    return 0, 0, 1
+
+
+def setup_distributed() -> tuple[int, int, int]:
+    """Initialise the process group from torchrun's or Slurm's environment.
+
+    Returns ``(rank, local_rank, world_size)``. Falls back to a single-process
+    group without a launcher, so the same file runs on a laptop.
+    """
+    rank, local_rank, world_size = ranks_from_env(os.environ)
+    if world_size > 1 and "WORLD_SIZE" not in os.environ:      # srun: torchrun sets the rest itself
+        if "MASTER_ADDR" not in os.environ:
+            nodelist = os.environ["SLURM_JOB_NODELIST"]
+            head = subprocess.check_output(
+                ["scontrol", "show", "hostnames", nodelist], text=True
+            ).split()[0]
+            os.environ["MASTER_ADDR"] = head
+        os.environ.setdefault("MASTER_PORT", "29500")
+
+    torch.cuda.set_device(local_rank)
+    if world_size > 1:
+        dist.init_process_group(
+            backend="nccl", rank=rank, world_size=world_size,
+            # A cold cache on a shared filesystem can make the first epoch's data
+            # loading slow enough to trip the 30-minute default on the initial barrier.
+            timeout=_dt.timedelta(minutes=90),
+        )
+    return rank, local_rank, world_size
+
+
+def is_main() -> bool:
+    return (not dist.is_initialized()) or dist.get_rank() == 0
+
+
+def log(*a, **kw) -> None:
+    """Print from rank 0 only. Four ranks logging the same line helps nobody."""
+    if is_main():
+        print(*a, **kw, flush=True)
+
+
+def all_reduce_mean(values: dict[str, float], device) -> dict[str, float]:
+    """Average a dict of scalars across ranks so every rank sees one number."""
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return values
+    keys = sorted(values)
+    t = torch.tensor([values[k] for k in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    t /= dist.get_world_size()
+    return {k: float(v) for k, v in zip(keys, t.tolist())}
+
+
+# ============================================================
+# Mixture-aware distributed sampling
+# ============================================================
+def dataset_of(npz_path: Path) -> str:
+    """``.../sam3d_gt_aic/annotations/xxx.npz`` -> ``sam3d_gt_aic``."""
+    return npz_path.parent.parent.name
+
+
+INDEX_VERSION = 2
+
+
+class PairIndex:
+    """(image, npz) pairs held as numpy byte arrays instead of Path objects.
+
+    A plain ``list`` of 4.2 M ``(PosixPath, PosixPath)`` tuples is ~2 GB of
+    Python objects, and `build_jz_loaders` runs `persistent_workers=True` with
+    9 workers per rank -- 36 forked processes per node. Fork gives them
+    copy-on-write pages, but CPython writes a refcount into an object's header
+    just to *read* it, so every worker steadily converts the shared index into
+    a private copy of itself. Measured on 4-GPU nodes: 74-76 GiB resident per node
+    against a 160 GB cgroup, and the OOM-killer firing mid-epoch at epochs
+    14-33 with no Python traceback.
+
+    Three contiguous numpy arrays carry no per-element refcounts, so a fork
+    shares them and keeps sharing them. Paths are rebuilt on access -- ~2 us
+    against a ~6 ms __getitem__, i.e. free.
+
+    Indexing and iteration yield the same ``(Path, Path)`` tuples the list did,
+    so `build_mixture_weights`, `__len__` and `__getitem__` are unchanged.
+    """
+    __slots__ = ("root", "_sub", "_stem", "_ext")
+
+    def __init__(self, root, entries):
+        self.root = Path(root)
+        # 'S' (bytes) not 'U': numpy stores UTF-32 for 'U', 4x the memory, and
+        # these are filesystem paths that round-trip through UTF-8 exactly.
+        self._sub = np.array([e[0] for e in entries], dtype="S")
+        self._stem = np.array([e[1] for e in entries], dtype="S")
+        self._ext = np.array([e[2] for e in entries], dtype="S")
+
+    def __len__(self):
+        return len(self._stem)
+
+    def first_per_subfolder(self):
+        """Index of the first pair in each sub-folder (one np.unique over the
+        byte array; no Path objects)."""
+        return [int(k) for k in np.unique(self._sub, return_index=True)[1]]
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            # Stay compact through --max_images too, or the one configuration
+            # that slices is the one that reintroduces the Path list.
+            out = PairIndex.__new__(PairIndex)
+            out.root = self.root
+            out._sub, out._stem, out._ext = self._sub[i], self._stem[i], self._ext[i]
+            return out
+        sub = self._sub[i].decode(); stem = self._stem[i].decode()
+        d = self.root / sub
+        return (d / "images" / f"{stem}{self._ext[i].decode()}",
+                d / "annotations" / f"{stem}.npz")
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    def nbytes(self):
+        return self._sub.nbytes + self._stem.nbytes + self._ext.nbytes
+
+
+def _index_fingerprint(data_root: Path) -> list:
+    """Cheap identity for the corpus: the sub-folders and their mtimes.
+
+    A directory's mtime changes when entries are added or removed, so this
+    catches the cases that matter (a split rebuilt, a split added) at the cost
+    of a handful of stat() calls rather than millions. It will NOT catch a file
+    rewritten in place with the same name -- use --rebuild-index for that.
+    """
+    fp = []
+    for ann, img in T.SAM3DStudentDataset._find_dataset_dirs(data_root):
+        fp.append([ann.parent.name,
+                   int(ann.stat().st_mtime_ns), int(img.stat().st_mtime_ns)])
+    return sorted(fp)
+
+
+def build_pair_index(data_root: str, cache: Path | None = None,
+                     rebuild: bool = False, log_fn=print) -> list:
+    """The (image, npz) pair list, cached to disk.
+
+    Scanning 3.7 M crops takes over an hour on a network filesystem and every rank of every
+    job in a chained run would otherwise repeat it. The cache stores
+    ``(sub_folder, stem, image_extension)`` rather than full paths -- an order
+    of magnitude smaller than pickling Path objects -- and paths are rebuilt on
+    load, which is seconds rather than minutes because it touches no metadata.
+    """
+    root = Path(data_root)
+    cache = Path(cache) if cache else root / f".pair_index_v{INDEX_VERSION}.pkl"
+    fp = _index_fingerprint(root)
+
+    if cache.exists() and not rebuild:
+        try:
+            with cache.open("rb") as fh:
+                blob = pickle.load(fh)
+            if blob.get("version") == INDEX_VERSION and blob.get("fingerprint") == fp:
+                pairs = PairIndex(root, blob["entries"])
+                # One stat() against millions saved. Catches a cache written by
+                # an older build whose stored sub-folder does not round-trip
+                # under this data_root -- silently wrong paths would otherwise
+                # surface as a FileNotFoundError from a dataloader worker hours
+                # into a job.
+                if pairs and not pairs[0][0].exists():
+                    log_fn(f"  pair index: {cache} does not resolve under "
+                           f"{root} (first entry {pairs[0][0]}) — rebuilding")
+                    raise FileNotFoundError(cache)
+                log_fn(f"  pair index: {len(pairs):,} crops from cache {cache} "
+                       f"(built {blob.get('built', '?')}, "
+                       f"{pairs.nbytes()/2**20:.0f} MiB resident)")
+                return pairs
+            log_fn(f"  pair index: {cache} is stale (corpus changed) — rebuilding")
+        except Exception as e:                      # truncated / half-written
+            log_fn(f"  pair index: {cache} unreadable ({e}) — rebuilding")
+
+    t0 = time.time()
+    log_fn(f"  pair index: scanning {root} (slow — this is why it is cached)")
+    ds = T.SAM3DStudentDataset(str(root), augment=False, per_dataset_caps=None)
+    # relative_to(root), not .name: when data_root IS a split -- it holds
+    # annotations/ and images/ directly -- .name is the root's own folder and
+    # rebuilding yields <root>/<root name>/images/... For the nested layout the
+    # two are identical, which is why INDEX_VERSION does not need bumping and
+    # existing caches stay valid. Path / "." normalises away, so no special case.
+    entries = [(str(npz.parent.parent.relative_to(root)), npz.stem, img.suffix)
+               for img, npz in ds.pairs]
+    log_fn(f"  pair index: {len(entries):,} crops in {time.time() - t0:.0f}s")
+
+    try:
+        tmp = cache.with_suffix(cache.suffix + ".tmp")
+        with tmp.open("wb") as fh:
+            pickle.dump({"version": INDEX_VERSION, "fingerprint": fp,
+                         "built": time.strftime("%Y-%m-%d %H:%M"),
+                         "entries": entries}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache)
+        log_fn(f"  pair index: cached to {cache}")
+    except OSError as e:
+        # A read-only data root is not fatal — it just means we pay the scan
+        # again next time. Say so rather than dying an hour into startup.
+        log_fn(f"  pair index: could NOT cache to {cache} ({e}); "
+               f"every job will repeat the scan")
+    # Return the compact form, not ds.pairs: a cold start must not be the one
+    # configuration that still hands 4.2 M Path objects to 36 forked workers.
+    return PairIndex(root, entries)
+
+
+def build_mixture_weights(dataset, mix: str | None) -> tuple[torch.Tensor, str]:
+    """Per-sample sampling weights implementing a target dataset mixture.
+
+    ``mix`` is either ``"sqrt"`` / ``"uniform"`` / ``"equal"``, or an explicit
+    ``name=proportion`` list (``sa1b=0.4,aic=0.35,coco=0.15,mpii=0.1``, matched
+    as a substring of the split folder name). Proportions are renormalised, so
+    they need not sum to 1.
+
+    - ``uniform``: every crop equally likely — SA-1B ends up at 91%.
+    - ``sqrt``: proportion proportional to sqrt(count). The usual compromise for
+      a long-tailed corpus: keeps the big split dominant without erasing the
+      small ones.
+    - ``equal``: every split contributes the same number of samples per epoch.
+      With MPII at 7 k crops that means ~50x oversampling, which augmentation
+      cannot disguise — expect it to overfit MPII.
+    """
+    names = [dataset_of(npz) for _, npz in dataset.pairs]
+    counts: dict[str, int] = {}
+    for n in names:
+        counts[n] = counts.get(n, 0) + 1
+    splits = sorted(counts)
+
+    if mix in (None, "sqrt"):
+        target = {s: math.sqrt(counts[s]) for s in splits}
+    elif mix == "uniform":
+        target = {s: float(counts[s]) for s in splits}
+    elif mix == "equal":
+        target = {s: 1.0 for s in splits}
+    else:
+        req: dict[str, float] = {}
+        for tok in mix.split(","):
+            k, _, v = tok.partition("=")
+            req[k.strip()] = float(v)
+        target = {}
+        for s in splits:
+            hit = [v for k, v in req.items() if k in s]
+            if len(hit) > 1:
+                raise ValueError(f"--mix key matches '{s}' more than once: {req}")
+            target[s] = hit[0] if hit else 0.0
+        if sum(target.values()) <= 0:
+            raise ValueError(f"--mix matched no split. Splits present: {splits}")
+
+    tot = sum(target.values())
+    prop = {s: target[s] / tot for s in splits}
+    # Per-sample weight: a split's total probability mass divided evenly over
+    # its crops. WeightedRandomSampler normalises, so absolute scale is free.
+    per_sample = {s: (prop[s] / counts[s] if counts[s] else 0.0) for s in splits}
+    w = torch.tensor([per_sample[n] for n in names], dtype=torch.double)
+
+    rows = [f"  {'split':<24}{'crops':>12}{'raw %':>9}{'sampled %':>11}"]
+    total = sum(counts.values())
+    for s in splits:
+        rows.append(f"  {s:<24}{counts[s]:>12,}{100*counts[s]/total:>8.1f}%"
+                    f"{100*prop[s]:>10.1f}%")
+    return w, "\n".join(rows)
+
+
+class DistributedWeightedSampler(Sampler[int]):
+    """Weighted sampling with replacement, sharded across ranks.
+
+    ``WeightedRandomSampler`` has no distributed variant. Rather than sample
+    per rank — which would give each rank a different mixture and a different
+    epoch length — every rank draws the *same* index list from a generator
+    seeded with ``(seed, epoch)``, then takes its own stride. So the global
+    mixture is exactly the requested one, the shards are disjoint, and the
+    sequence is reproducible from the epoch number alone, which is what makes
+    resume deterministic.
+    """
+
+    def __init__(self, weights: torch.Tensor, num_samples: int,
+                 num_replicas: int, rank: int, seed: int = 0):
+        self.weights = weights.double()
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        # Round up so every rank gets the same count; DDP deadlocks if one rank
+        # runs out of batches before the others.
+        self.per_rank = int(math.ceil(num_samples / num_replicas))
+        self.total = self.per_rank * num_replicas
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.per_rank
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed * 100_003 + self.epoch)
+        idx = torch.multinomial(self.weights, self.total, replacement=True, generator=g)
+        return iter(idx[self.rank::self.num_replicas].tolist())
+
+
+# ============================================================
+# Data
+# ============================================================
+def build_jz_loaders(cfg, args, rank: int, world: int):
+    """Train loader with mixture sampling, plus a small held-out val loader.
+
+    The val split is a fixed slice of the *same* corpus, so it measures
+    agreement with the teacher rather than generalisation — it is a training
+    health signal, not a model-selection metric. Keep it small (``--val-frac``,
+    default 2%): with 3.74 M crops even 1% is 37 k samples, and evaluating it
+    every epoch is pure overhead. See ``--val-3dpw`` in the README notes for
+    the held-out alternative.
+    """
+    geom = dict(geom_p=cfg.geom_p, geom_rot_deg=cfg.geom_rot_deg,
+                geom_scale_range=cfg.geom_scale_range,
+                geom_trans=cfg.geom_trans, geom_flip_p=cfg.geom_flip_p,
+                geom_scale_max=cfg.geom_scale_max,
+                cliff_follows_aug=cfg.cliff_follows_aug,
+                crop_centre_fix=cfg.crop_centre_fix,
+                cliff_focal=cfg.cliff_focal,
+                occl_p=cfg.occl_p, occl_scale=cfg.occl_scale,
+                jpeg_p=cfg.jpeg_p, jpeg_quality=cfg.jpeg_quality,
+                image_size=cfg.image_size,
+                context_crops=cfg.context_crops, v3_box_min=cfg.v3_box_min,
+                v3_box_max=cfg.v3_box_max, v3_shift=cfg.v3_shift,
+                v3_lanczos=cfg.v3_lanczos, crop_windows=cfg.crop_windows,
+                window_mode=cfg.window_mode, window0_p=cfg.window0_p,
+                temporal=T.temporal_kwargs(cfg))
+
+    # Rank 0 builds the index (or reads the cache) while the others wait, then
+    # everyone loads the same cache. Building on all ranks at once would put
+    # world_size concurrent metadata storms on the same filesystem, which is
+    # slower than doing it once and antisocial on a shared cluster.
+    if world > 1 and rank != 0:
+        dist.barrier()
+    pairs = build_pair_index(cfg.data_root, args.index_cache,
+                             rebuild=args.rebuild_index, log_fn=log)
+    if world > 1 and rank == 0:
+        dist.barrier()
+    if cfg.max_images is not None:
+        pairs = pairs[:cfg.max_images]
+
+    # Both datasets share one index; only the augmentation pipeline differs.
+    train_ds = T.SAM3DStudentDataset(
+        cfg.data_root, augment=cfg.augment, pairs=pairs, **geom)
+    val_ds = T.SAM3DStudentDataset(
+        cfg.data_root, augment=False, pairs=pairs, **geom)
+
+    n = len(train_ds)
+    g = torch.Generator().manual_seed(42)          # fixed: the split must not
+    perm = torch.randperm(n, generator=g).tolist()  # move when --seed changes
+    n_val = max(1, int(n * args.val_frac))
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+    weights_all, report = build_mixture_weights(train_ds, args.mix)
+    log(f"\ndataset mixture ('{args.mix or 'sqrt'}'):\n{report}")
+
+    # Zero out the val indices so the sampler can never draw them.
+    w = weights_all.clone()
+    w[torch.tensor(val_idx, dtype=torch.long)] = 0.0
+
+    sampler = DistributedWeightedSampler(
+        w, num_samples=args.samples_per_epoch,
+        num_replicas=world, rank=rank, seed=args.seed)
+
+    loader_kw = dict(num_workers=cfg.num_workers, pin_memory=True, drop_last=True)
+    if cfg.num_workers > 0:
+        loader_kw.update(persistent_workers=True, prefetch_factor=args.prefetch_factor)
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size,
+                              sampler=sampler, **loader_kw)
+
+    # Val is sharded by plain striding — no weighting, no replacement.
+    val_subset = val_idx[rank::world]
+    val_loader = DataLoader(
+        torch.utils.data.Subset(val_ds, val_subset),
+        batch_size=cfg.batch_size, shuffle=False,
+        num_workers=max(1, cfg.num_workers // 2), pin_memory=True, drop_last=False)
+
+    log(f"train pool {len(train_idx):,} crops | val {n_val:,} "
+        f"({len(val_subset):,} on this rank) | "
+        f"{args.samples_per_epoch:,} samples/epoch")
+    return train_loader, val_loader, sampler, train_ds
+
+
+# ============================================================
+# Checkpointing
+# ============================================================
+def atomic_save_json(path: Path, obj: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    os.replace(tmp, path)
+
+
+def atomic_save(obj, path: Path) -> None:
+    """Write then rename. A job killed mid-``torch.save`` must not leave a
+    truncated ``last.pth`` — that would turn one lost epoch into a lost run."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def save_state(path: Path, *, model, ema, optimizer, scaler, scheduler,
+               epoch, best, args, cfg) -> None:
+    atomic_save({
+        "epoch": epoch,
+        "model_state_dict": unwrap(model).state_dict(),
+        "ema_state_dict": ema.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best": best,
+        "rng": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all(),
+        },
+        "run": {"seed": args.seed, "epochs": args.epochs,
+                "samples_per_epoch": args.samples_per_epoch,
+                "batch_size": cfg.batch_size, "lr": cfg.lr, "mix": args.mix},
+    }, path)
+
+
+def unwrap(m):
+    return m.module if isinstance(m, (DDP, AveragedModel)) else m
+
+
+# ============================================================
+# Validation
+# ============================================================
+@torch.no_grad()
+def run_validation(eval_model, loader, criterion, cfg, mhr_module, device):
+    eval_model.eval()
+    acc = {"loss": 0.0, "Mesh_MPJPE": 0.0, "Mesh_PA_MPJPE": 0.0,
+           "Mesh_PA_MPJPE_body": 0.0}
+    n = 0
+    for batch in loader:
+        batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                 for k, v in batch.items()}
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=cfg.use_amp):
+            preds = eval_model(batch["image"], batch["cliff_cond"])
+        preds = {k: v.float() for k, v in preds.items()}
+        losses = criterion(preds, batch)
+        lv = losses["total_loss"].item()
+        if math.isnan(lv) or math.isinf(lv):
+            continue
+        bm = T.evaluate_hmr_batch(preds, batch, cfg, mhr_module)
+        acc["loss"] += lv
+        acc["Mesh_MPJPE"] += bm.get("Mesh_MPJPE", 0.0)
+        acc["Mesh_PA_MPJPE"] += bm.get("Mesh_PA_MPJPE", 0.0)
+        # Reported only. Mesh_PA_MPJPE is 60% fingers by keypoint count; this is
+        # the 30 body/face/foot keypoints. Selection is untouched — and when
+        # --val-3dpw is on, both of these are replaced by the 3DPW J14 numbers.
+        acc["Mesh_PA_MPJPE_body"] += bm.get("Mesh_PA_MPJPE_body", 0.0)
+        n += 1
+    out = {k: v / max(n, 1) for k, v in acc.items()}
+    out["n"] = float(n)
+    # Average over ranks so the early-stopping decision is identical everywhere.
+    return all_reduce_mean(out, device)
+
+
+# ============================================================
+# Training
+# ============================================================
+def train(args, cfg, rank, local_rank, world):
+    device = torch.device(f"cuda:{local_rank}")
+    T.device = device                     # the module global some helpers read
+    out_dir = Path(cfg.log_dir)
+    if is_main():
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    W = np.load(cfg.kp_regressor_path)
+    mhr_module = T.MHRForwardPass(
+        cfg.mhr_model_path, device, kp_regressor=W,
+        n_verts=cfg.n_verts if cfg.w_verts > 0 else 0,
+        landmark_assets=(cfg.landmark_assets_path
+                         if cfg.exact_landmarks or args.val_landmarks == "exact"
+                         else None))
+    criterion = T.DistillationLoss(cfg, mhr_module)
+
+    train_loader, val_loader, sampler, _ = build_jz_loaders(cfg, args, rank, world)
+    steps_per_epoch = len(train_loader)
+
+    dpw_loader = dpw_test_loader = dpw_adapter = None
+    if args.val_3dpw:
+        if not args.val_3dpw_images:
+            raise SystemExit("--val-3dpw needs --val-3dpw-images")
+        from val3dpw import ThreeDPWValSet
+        if str(args.val_3dpw_adapter).lower() != "none":
+            ap = Path(args.val_3dpw_adapter)
+            if not ap.is_absolute():
+                ap = Path(__file__).resolve().parent.parent / ap
+            if not ap.is_file():
+                raise SystemExit(
+                    f"3DPW adapter not found: {ap}\nIt ships in the repo as "
+                    "training/assets/adapter_j14_h36m.npz; "
+                    "or pass --val-3dpw-adapter none to score raw MHR joints.")
+            dpw_adapter = np.load(ap)["W"]
+            log(f"3DPW adapter: {ap.name} {tuple(dpw_adapter.shape)} "
+                f"-> J14 PA-MPJPE through the MHR70->J14 adapter")
+        dpw = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
+                             split=args.val_3dpw_split, stride=args.val_3dpw_stride,
+                             gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal,
+                             input_size=cfg.image_size)
+        # Stride-shard across ranks; the metric is all-reduced afterwards.
+        dpw_loader = torch.utils.data.DataLoader(
+            torch.utils.data.Subset(dpw, list(range(rank, len(dpw), world))),
+            batch_size=cfg.batch_size, shuffle=False, drop_last=False,
+            num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
+        log(f"3DPW {args.val_3dpw_split}: {len(dpw):,} person-frames "
+            f"(stride {args.val_3dpw_stride}, GT {args.val_3dpw_gt}) "
+            f"-> selection metric is J14 PA-MPJPE (adapter-applied, "
+            f"{args.val_landmarks} 70-keypoint readout)")
+
+        # Optional read-only monitor on the split the paper reports. Selection
+        # NEVER touches it: picking the best of ~100 epochs on the test split
+        # would bank a few mm of selection luck and the published number would
+        # no longer be held out. Watching it is fine; optimising against it is
+        # not, so it is logged and never compared to `best`.
+        if args.val_3dpw_test:
+            dpw_t = ThreeDPWValSet(args.val_3dpw, args.val_3dpw_images,
+                                   split="test", stride=args.val_3dpw_test_stride,
+                                   gt=args.val_3dpw_gt, cliff_focal=cfg.cliff_focal,
+                                   input_size=cfg.image_size)
+            dpw_test_loader = torch.utils.data.DataLoader(
+                torch.utils.data.Subset(dpw_t, list(range(rank, len(dpw_t), world))),
+                batch_size=cfg.batch_size, shuffle=False, drop_last=False,
+                num_workers=max(1, cfg.num_workers // 2), pin_memory=True)
+            log(f"3DPW test:       {len(dpw_t):,} person-frames "
+                f"(stride {args.val_3dpw_test_stride}) -> REPORTED ONLY, "
+                f"never used for checkpoint selection")
+
+    model = T.InstantHMRStudent(cfg, pretrained=not args.no_pretrained).to(device)
+    if args.init_from and not ((out_dir / "last.pth").exists() and not args.no_resume):
+        # Before the EMA copy below, so the EMA starts from these weights too.
+        ck = torch.load(args.init_from, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["model_state_dict"], strict=False)
+        new = ("prev_proj.", "prev_query", "prev_mask_embed", "contact_head.")
+        bad = [k for k in missing if not k.startswith(new)] + list(unexpected)
+        if bad:
+            raise SystemExit(f"--init-from {args.init_from}: keys do not match the "
+                             f"model built from these flags: {bad[:8]}")
+        log(f"🧩 initialised from {args.init_from} (epoch {ck.get('epoch')}); "
+            f"{len(missing)} new parameter tensors keep their init")
+    if args.sync_bn and world > 1:
+        # repvit is 218 BatchNorm2d layers. At batch 64 per GPU the local stats
+        # are already reliable, so this is off by default — it costs an all-
+        # reduce per BN layer per step for no accuracy gain at this batch size.
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    ddp_model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=False) if world > 1 else model
+
+    param_groups = T.build_param_groups(model, cfg.weight_decay,
+                                        split_wd=cfg.split_weight_decay)
+    optimizer = optim.AdamW(param_groups, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scaler = torch.amp.GradScaler(device="cuda", enabled=cfg.use_amp)
+    scheduler = lr_scheduler.OneCycleLR(
+        optimizer, max_lr=cfg.lr, epochs=args.epochs,
+        steps_per_epoch=steps_per_epoch, pct_start=0.1)
+    ema = AveragedModel(model, multi_avg_fn=T.make_ema_avg_fn(cfg.ema_decay),
+                        use_buffers=True)
+
+    start_epoch = 0
+    best = {"raw": float("inf"), "ema": float("inf"), "overall": float("inf"),
+            "no_improve": 0}
+    last_path = out_dir / "last.pth"
+    if last_path.exists() and not args.no_resume:
+        ck = torch.load(last_path, map_location=device, weights_only=False)
+        prev = ck.get("run", {})
+        prev_epochs = prev.get("epochs")
+        extending = bool(args.extend and prev_epochs is not None
+                         and args.epochs > prev_epochs)
+        for k in ("epochs", "samples_per_epoch", "batch_size"):
+            cur = {"epochs": args.epochs, "samples_per_epoch": args.samples_per_epoch,
+                   "batch_size": cfg.batch_size}[k]
+            if prev.get(k) not in (None, cur) and not (k == "epochs" and extending):
+                log(f"⚠️  {k} changed {prev[k]} -> {cur} since the checkpoint. "
+                    f"OneCycleLR's schedule is defined over the ORIGINAL total "
+                    f"step count, so the LR curve will not match a fresh run.")
+        # A changed --lr on resume is silently ignored: OneCycleLR keeps max_lr in
+        # the optimiser's param groups, and optimizer.load_state_dict below
+        # restores the checkpoint's. You would think you were training at the new
+        # rate and actually be back at the old one. Refuse instead -- this cost a
+        # 16-hour run once.
+        prev_lr = prev.get("lr")
+        if prev_lr is not None and abs(prev_lr - cfg.lr) > 1e-12 and not extending:
+            raise SystemExit(
+                f"refusing to resume: checkpoint was trained at peak lr "
+                f"{prev_lr:.3e}, this invocation asks for {cfg.lr:.3e}.\n"
+                f"OneCycleLR stores max_lr in the optimiser state, so resuming "
+                f"would silently use {prev_lr:.3e} and ignore your --lr.\n"
+                f"Use a NEW --output_dir (RUN_NAME) to start fresh at "
+                f"{cfg.lr:.3e}, or delete {last_path} to restart in place.")
+
+        unwrap(model).load_state_dict(ck["model_state_dict"])
+        ema.load_state_dict(ck["ema_state_dict"])
+        optimizer.load_state_dict(ck["optimizer_state_dict"])
+        scaler.load_state_dict(ck["scaler_state_dict"])
+        start_epoch = ck["epoch"] + 1
+        if extending:
+            # A finished OneCycle run sits at lr ~= 0, and its state_dict carries
+            # total_steps -- loading it would clobber the longer schedule built
+            # above and then raise on the first step past the old total. Instead
+            # keep the NEW schedule and fast-forward it to where we are, so the
+            # remaining epochs follow the tail of a curve drawn for the full
+            # extended length.
+            #
+            # Be clear about what this is: a warm restart, not the same
+            # trajectory as one uninterrupted run of the longer length, because
+            # the weights up to here were produced under a schedule that had
+            # already annealed. Fine for squeezing more out of a converged run;
+            # not a substitute for choosing the epoch count up front when two
+            # arms have to be comparable.
+            for _ in range(start_epoch * steps_per_epoch):
+                scheduler.step()
+            log(f"⏩ extending {prev_epochs} -> {args.epochs} epochs. Warm restart: "
+                f"schedule rebuilt over the new total and fast-forwarded to "
+                f"step {start_epoch * steps_per_epoch:,}, lr "
+                f"{scheduler.get_last_lr()[0]:.2e}. NOT equivalent to a single "
+                f"{args.epochs}-epoch run.")
+        else:
+            scheduler.load_state_dict(ck["scheduler_state_dict"])
+        best = ck["best"]
+        if (r := ck.get("rng")):
+            random.setstate(r["python"]); np.random.set_state(r["numpy"])
+            torch.set_rng_state(r["torch"].cpu())
+            try:
+                torch.cuda.set_rng_state_all([s.cpu() for s in r["cuda"]])
+            except Exception:
+                pass   # a different GPU count than the run that saved it
+        log(f"🔄 resumed from {last_path} at epoch {start_epoch} "
+            f"(best PA-MPJPE {best['overall']:.1f} mm)")
+    else:
+        log("🚀 starting from scratch")
+
+    log(f"steps/epoch {steps_per_epoch} | world {world} | "
+        f"effective batch {cfg.batch_size * world} | peak lr {cfg.lr:.2e}")
+
+    if is_main():
+        # The settings of the run, read back by T.config_from_checkpoint (and by
+        # tools/pth_to_onnx.py) to rebuild the model exactly.
+        atomic_save_json(out_dir / "run_config.json", {
+            "preset": args.preset, "seed": args.seed, "epochs": args.epochs,
+            "samples_per_epoch": args.samples_per_epoch,
+            "batch_size": cfg.batch_size, "world": world,
+            "lr": cfg.lr, "lr_arg": args.lr, "lr_scaling": args.lr_scaling,
+            "mix": args.mix, "steps_per_epoch": steps_per_epoch,
+            "backbone": cfg.backbone, "w_reproj": cfg.w_reproj,
+            "image_size": cfg.image_size, "context_crops": cfg.context_crops,
+            "v3_box": [cfg.v3_box_min, cfg.v3_box_max], "v3_shift": cfg.v3_shift,
+            "v3_lanczos": cfg.v3_lanczos, "crop_windows": cfg.crop_windows,
+            "window_mode": cfg.window_mode if cfg.crop_windows else None,
+            "window0_p": cfg.window0_p,
+            "cont_head": cfg.cont_head, "root_rot_loss": cfg.root_rot_loss,
+            "exact_landmarks": cfg.exact_landmarks,
+            "geom_scale_max": cfg.geom_scale_max, "occl_p": cfg.occl_p,
+            "jpeg_p": cfg.jpeg_p, "cam_loss": cfg.cam_loss,
+            "losses": args.losses, "w_shape": cfg.w_shape,
+            "w_keypoints3d": cfg.w_keypoints3d, "kp3d_loss": cfg.kp3d_loss,
+            "pose_split": cfg.pose_split, "pose_beta": cfg.pose_beta,
+            "finger_weight": cfg.finger_weight,
+            "val_3dpw_gt": args.val_3dpw_gt if args.val_3dpw else None,
+            "val_landmarks": args.val_landmarks if args.val_3dpw else None,
+            "cliff_focal": cfg.cliff_focal,
+            "w_verts": cfg.w_verts, "n_verts": cfg.n_verts,
+            "crop_centre_fix": cfg.crop_centre_fix,
+            "bound_scales": cfg.bound_scales,
+            "scale_bound_margin": cfg.scale_bound_margin,
+            "anomaly_safe_fallback": cfg.anomaly_safe_fallback,
+            "init_from": args.init_from,
+            "prev_token": cfg.prev_token, "contact_head": cfg.contact_head,
+            "prev_mask_p": cfg.prev_mask_p, "prev_pairs_only": cfg.prev_pairs_only,
+            "w_contact": cfg.w_contact,
+            "w_zero_vel": cfg.w_zero_vel, "w_foot_mocap": cfg.w_foot_mocap,
+            "contact_floor": cfg.contact_floor,
+            "contact_flight_weight": cfg.contact_flight_weight,
+            "started": time.strftime("%Y-%m-%d %H:%M")})
+
+    ema_rollbacks = 0
+    for epoch in range(start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
+        ddp_model.train()
+        # reproj and cam are here because --preset v2 changes both; without them
+        # a regression in the absolute-pose supervision is invisible in
+        # history.jsonl and you would have to guess from the total.
+        run = {"total": 0.0, "3d": 0.0, "2d": 0.0, "simcc": 0.0,
+               "reproj": 0.0, "cam": 0.0, "pose": 0.0}
+        # The surface term is worth its own column: at w_verts=1 it reads
+        # directly as mean PVE in metres, so verts/w_verts*1000 is millimetres.
+        if cfg.w_verts > 0:
+            run["verts"] = 0.0
+        nb = 0
+        n_skip = n_skip_run = n_repair = 0
+        t_epoch = time.time()
+        criterion.set_step(epoch * steps_per_epoch)
+        for i, batch in enumerate(train_loader):
+            batch = {k: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+                     for k, v in batch.items()}
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=cfg.use_amp):
+                preds = ddp_model(batch["image"], batch["cliff_cond"],
+                                  batch.get("prev_pose"), batch.get("has_prev"))
+            preds = {k: v.float() for k, v in preds.items()}
+            losses = criterion(preds, batch)
+            loss = losses["total_loss"]
+            lv = loss.item()
+
+            # An anomalous step is skipped, but every rank must agree or DDP's
+            # gradient all-reduce deadlocks: rank 0 skipping while rank 1 steps
+            # leaves rank 1 waiting forever. Vote, then act together.
+            bad = int(math.isnan(lv) or math.isinf(lv) or lv > cfg.anomaly_loss_threshold)
+            if world > 1:
+                flag = torch.tensor([bad], device=device)
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+                bad = int(flag.item())
+            if bad:
+                # An anomalous batch is anomalous because the FK terms blew up.
+                # `loss_scale` / `loss_pose` in the SAME batch are small and
+                # point straight back at the teacher — they are the only force
+                # that pulls the bone scales out of the runaway region — so
+                # discarding the batch wholesale removes the fix along with the
+                # fault and quarantines those samples permanently. Step on the
+                # non-FK subset instead when it is finite. Every rank must take
+                # the same branch or the all-reduce deadlocks, so vote again.
+                safe_ok, safe = 0, None
+                if cfg.anomaly_safe_fallback:
+                    safe = T.safe_loss_subset(losses)
+                    sv = safe.item()
+                    safe_ok = int(math.isfinite(sv)
+                                  and sv <= cfg.anomaly_loss_threshold)
+                    if world > 1:
+                        f2 = torch.tensor([safe_ok], device=device)
+                        dist.all_reduce(f2, op=dist.ReduceOp.MIN)
+                        safe_ok = int(f2.item())
+                if safe_ok:
+                    scaler.scale(safe).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(ddp_model.parameters(),
+                                                   cfg.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    ema.update_parameters(unwrap(ddp_model))
+                    n_repair += 1
+                    if n_repair == 1 or n_repair % 200 == 0:
+                        log(f"🩹 repaired step {i}: FK terms dropped "
+                            f"(total {lv:.1f}), stepped on the bounded terms "
+                            f"({sv:.3f}) [{n_repair} this epoch]")
+                    # A repaired step DID update the weights in the corrective
+                    # direction, so it is progress, not a skip: the consecutive
+                    # counter that drives rollback/abort resets.
+                    n_skip_run = 0
+                    del preds, losses, loss, safe
+                    continue
+
+                n_skip += 1
+                n_skip_run += 1
+                # Step the schedule ANYWAY. Skipping it freezes the LR, and a
+                # too-high LR is what produces anomalies in the first place, so
+                # `continue`-ing past it is a runaway: skip -> LR stays at peak
+                # -> more skips -> never anneals. Measured on the first sweep:
+                # by epoch 20 the scheduler had taken 8,161 of 29,678 steps and
+                # the LR was pinned at 1.18e-3 instead of annealing to 4.3e-4.
+                scheduler.step()
+                # Drop the graph before the next forward builds another one.
+                # Without this, `continue` leaves two autograd graphs alive at
+                # once -- measured 1.8x peak memory, 9.3 -> 17.2 GiB, which OOMs
+                # a 16 GB node.
+                del preds, losses, loss
+                if n_skip_run == 1 or n_skip_run % 100 == 0:
+                    log(f"⚠️  skipping step {i} (loss {lv:.1f}) "
+                        f"[{n_skip_run} consecutive]")
+
+                # EMA rollback. This existed only in train's
+                # single-GPU loop; the DDP path had the abort and no recovery,
+                # so every divergence burned the whole job.
+                # Both branches are driven by the already-all-reduced skip
+                # count, so all ranks roll back on the same step, and the EMA
+                # is bit-identical across ranks (DDP keeps the weights in sync
+                # and every rank averages the same thing).
+                if n_skip_run >= cfg.anomaly_skip_patience:
+                    if ema_rollbacks >= cfg.max_ema_rollbacks:
+                        raise RuntimeError(
+                            f"still stuck after {cfg.max_ema_rollbacks} EMA "
+                            f"rollback(s) at epoch {epoch + 1}. The best RAW / "
+                            f"EMA checkpoints on disk are unaffected. Exiting "
+                            f"rather than burning the remaining "
+                            f"{args.epochs - epoch} epochs.")
+                    ema_rollbacks += 1
+                    log(f"🚑 {n_skip_run} consecutive anomalous steps: rolling "
+                        f"the raw weights back to the EMA copy "
+                        f"(attempt {ema_rollbacks}/{cfg.max_ema_rollbacks}), "
+                        f"scaling the LR by {cfg.anomaly_rollback_lr_decay} "
+                        f"and clearing the optimiser moments.")
+                    unwrap(ddp_model).load_state_dict(ema.module.state_dict())
+                    # The Adam moments are what drove the model out of the
+                    # valid region; carrying them over walks straight back out.
+                    optimizer.state.clear()
+                    T.scale_lr(optimizer, cfg.anomaly_rollback_lr_decay,
+                               scheduler)
+                    log(f"   LR is now {optimizer.param_groups[0]['lr']:.2e}")
+                    n_skip_run = 0
+                    continue
+
+                if n_skip_run >= cfg.max_consecutive_skips:
+                    raise RuntimeError(
+                        f"{n_skip_run} consecutive anomalous steps at epoch "
+                        f"{epoch + 1} — the run has diverged and will not "
+                        f"recover. Lower --lr (or use --lr-scaling sqrt/none) "
+                        f"and restart. Exiting rather than burning the "
+                        f"remaining {args.epochs - epoch} epochs.")
+                continue
+            n_skip_run = 0
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            ema.update_parameters(unwrap(ddp_model))
+            criterion.set_step(epoch * steps_per_epoch + i)
+
+            run["total"] += lv
+            run["3d"] += losses.get("loss_3d_native", torch.zeros(())).item()
+            run["2d"] += losses.get("loss_2d_native", torch.zeros(())).item()
+            run["simcc"] += losses.get("loss_2d_simcc", torch.zeros(())).item()
+            run["reproj"] += losses.get("loss_reproj", torch.zeros(())).item()
+            if "verts" in run:
+                run["verts"] += losses.get("loss_verts", torch.zeros(())).item()
+            run["cam"] += losses.get("loss_cam", torch.zeros(())).item()
+            # Under cfg.pose_split, loss_pose is the local half and loss_pose_root
+            # the other; summing keeps history.jsonl's "pose" column comparable
+            # against a --losses legacy run.
+            run["pose"] += (losses.get("loss_pose", torch.zeros(())).item()
+                            + losses.get("loss_pose_root", torch.zeros(())).item())
+            nb += 1
+            if is_main() and i % args.log_every == 0:
+                log(f"  e{epoch+1}/{args.epochs} step {i}/{steps_per_epoch} "
+                    f"loss {lv:.4f} lr {scheduler.get_last_lr()[0]:.2e}")
+
+        tr = all_reduce_mean({k: v / max(nb, 1) for k, v in run.items()}, device)
+        raw = run_validation(ddp_model, val_loader, criterion, cfg, mhr_module, device)
+        em = run_validation(ema, val_loader, criterion, cfg, mhr_module, device)
+
+        # 3DPW, when available, replaces the held-in metric for selection: it is
+        # the only signal here that measures generalisation rather than teacher
+        # agreement. The held-in numbers keep printing either way.
+        dpw_raw = dpw_em = dpw_test_raw = dpw_test_em = None
+        if dpw_loader is not None:
+            import val3dpw
+            exact_lm = args.val_landmarks == "exact"
+            dpw_raw = all_reduce_mean(
+                val3dpw.evaluate(ddp_model, dpw_loader, mhr_module, device,
+                                 cfg.use_amp, gt=args.val_3dpw_gt,
+                                 adapter=dpw_adapter, exact_landmarks=exact_lm),
+                device)
+            dpw_em = all_reduce_mean(
+                val3dpw.evaluate(ema, dpw_loader, mhr_module, device,
+                                 cfg.use_amp, gt=args.val_3dpw_gt,
+                                 adapter=dpw_adapter, exact_landmarks=exact_lm),
+                device)
+            if dpw_test_loader is not None:
+                dpw_test_raw = all_reduce_mean(val3dpw.evaluate(
+                    ddp_model, dpw_test_loader, mhr_module, device, cfg.use_amp,
+                    gt=args.val_3dpw_gt, adapter=dpw_adapter,
+                    exact_landmarks=exact_lm), device)
+                dpw_test_em = all_reduce_mean(val3dpw.evaluate(
+                    ema, dpw_test_loader, mhr_module, device, cfg.use_amp,
+                    gt=args.val_3dpw_gt, adapter=dpw_adapter), device)
+            raw["Mesh_PA_MPJPE"], em["Mesh_PA_MPJPE"] = (
+                dpw_raw["J14_PA_MPJPE"], dpw_em["J14_PA_MPJPE"])
+            raw["Mesh_MPJPE"], em["Mesh_MPJPE"] = (
+                dpw_raw["J14_MPJPE"], dpw_em["J14_MPJPE"])
+
+        # Peak GPU across ALL ranks, not just rank 0.  Rank 0 is not the
+        # hungriest rank: four jobs once died of CUDA OOM on a 16 GB GPU
+        # reporting 14.99 GiB allocated, while this line -- rank 0 only --
+        # printed a flat 9.3 GiB for 32 straight epochs.
+        _pk = torch.cuda.max_memory_allocated() / 2**30
+        pk_max, pk_rank = _pk, 0
+        if dist.is_initialized() and world > 1:
+            t = torch.tensor([_pk], device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            pk_max = float(t.item())
+            # Which rank owns the max, so a lopsided rank is named not guessed.
+            r = torch.tensor([rank if abs(_pk - pk_max) < 1e-6 else world],
+                             device=device)
+            dist.all_reduce(r, op=dist.ReduceOp.MIN)
+            pk_rank = int(r.item())
+        log(f"\n📈 epoch {epoch+1}/{args.epochs} | lr {scheduler.get_last_lr()[0]:.2e}"
+            f" | peak GPU {pk_max:.1f} GiB (max over {world} rank(s), "
+            f"rank {pk_rank}; rank 0 {_pk:.1f})")
+        log(f"   train  total {tr['total']:.4f} | 3d {tr['3d']:.4f} | "
+            f"2d {tr['2d']:.4f} | simcc {tr['simcc']:.3f} | "
+            f"reproj {tr['reproj']:.4f} | cam {tr['cam']:.4f} "
+            f"| skipped {n_skip}/{steps_per_epoch}"
+            f"{f' | repaired {n_repair}' if n_repair else ''}"
+            f" | {time.time() - t_epoch:.0f}s")
+        # Two different datasets, so two lines. The held-in slice scores
+        # against the TEACHER's labels on training-corpus data (agreement);
+        # 3DPW scores against real MoCap on sequences never seen
+        # (generalisation). With --val-3dpw on, Mesh_PA_MPJPE / Mesh_MPJPE are
+        # overwritten above with the 3DPW J14 numbers, so they are not printed
+        # under a held-in label there.
+        if dpw_raw is not None:
+            log(f"   held-in (teacher agreement)  RAW loss {raw['loss']:.4f} "
+                f"body PA {raw['Mesh_PA_MPJPE_body']:.1f} | EMA loss "
+                f"{em['loss']:.4f} body PA {em['Mesh_PA_MPJPE_body']:.1f} mm")
+            log(f"   3DPW-{args.val_3dpw_split}  "
+                f"RAW J14 PA {dpw_raw['J14_PA_MPJPE']:.1f} "
+                f"MPJPE {dpw_raw['J14_MPJPE']:.1f} | "
+                f"EMA J14 PA {dpw_em['J14_PA_MPJPE']:.1f} "
+                f"MPJPE {dpw_em['J14_MPJPE']:.1f} mm")
+            # Non-finite predictions are dropped rather than crashing the metric
+            # (see val3dpw.evaluate). Say so — a handful at epoch 1 is the raw
+            # branch still settling, a rising count is a real instability.
+            nd = dpw_raw.get("n_dropped", 0.0) + dpw_em.get("n_dropped", 0.0)
+            if nd > 0:
+                log(f"   ⚠️  3DPW: {nd:.0f} non-finite prediction(s) dropped "
+                    f"(raw {dpw_raw.get('n_dropped', 0.0):.0f} / "
+                    f"ema {dpw_em.get('n_dropped', 0.0):.0f})")
+        else:
+            log(f"   held-in RAW loss {raw['loss']:.4f} | PA-MPJPE "
+                f"{raw['Mesh_PA_MPJPE']:.1f} | MPJPE {raw['Mesh_MPJPE']:.1f} mm | "
+                f"body PA {raw['Mesh_PA_MPJPE_body']:.1f} mm")
+            log(f"   held-in EMA loss {em['loss']:.4f} | PA-MPJPE "
+                f"{em['Mesh_PA_MPJPE']:.1f} | MPJPE {em['Mesh_MPJPE']:.1f} mm | "
+                f"body PA {em['Mesh_PA_MPJPE_body']:.1f} mm")
+        if dpw_test_raw is not None:
+            log(f"   3DPW-TEST (report only, not used for selection)")
+            log(f"     RAW  J14 MPJPE {dpw_test_raw['J14_MPJPE']:.1f} | "
+                f"J14 PA {dpw_test_raw['J14_PA_MPJPE']:.1f} mm")
+            log(f"     EMA  J14 MPJPE {dpw_test_em['J14_MPJPE']:.1f} | "
+                f"J14 PA {dpw_test_em['J14_PA_MPJPE']:.1f} mm")
+
+        improved = False
+        if raw["Mesh_PA_MPJPE"] < best["raw"]:
+            best["raw"] = raw["Mesh_PA_MPJPE"]; improved = True
+            if is_main():
+                atomic_save({"model_state_dict": unwrap(model).state_dict(),
+                             "val_pa_mpjpe": best["raw"], "source": "raw",
+                             "epoch": epoch}, out_dir / "best_student_model_raw.pth")
+        if em["Mesh_PA_MPJPE"] < best["ema"]:
+            best["ema"] = em["Mesh_PA_MPJPE"]; improved = True
+            if is_main():
+                atomic_save({"model_state_dict": unwrap(ema).state_dict(),
+                             "val_pa_mpjpe": best["ema"], "source": "ema",
+                             "epoch": epoch}, out_dir / "best_student_model_ema.pth")
+        cur = min(raw["Mesh_PA_MPJPE"], em["Mesh_PA_MPJPE"])
+        if cur < best["overall"] - 1e-4:
+            best["overall"] = cur
+            use_ema = em["Mesh_PA_MPJPE"] <= raw["Mesh_PA_MPJPE"]
+            if is_main():
+                src = unwrap(ema) if use_ema else unwrap(model)
+                atomic_save({"model_state_dict": src.state_dict(),
+                             "val_pa_mpjpe": cur, "epoch": epoch,
+                             "source": "ema" if use_ema else "raw"},
+                            out_dir / "best_student_model_v3.pth")
+                log(f"💾 new best {cur:.1f} mm ({'EMA' if use_ema else 'RAW'})")
+        best["no_improve"] = 0 if improved else best["no_improve"] + 1
+
+        if is_main():
+            save_state(out_dir / "last.pth", model=model, ema=ema,
+                       optimizer=optimizer, scaler=scaler, scheduler=scheduler,
+                       epoch=epoch, best=best, args=args, cfg=cfg)
+            with (out_dir / "history.jsonl").open("a") as fh:
+                fh.write(json.dumps({"epoch": epoch, "train": tr,
+                                     "val_raw": raw, "val_ema": em,
+                                     "dpw_raw": dpw_raw, "dpw_ema": dpw_em,
+                                     "dpw_test_raw": dpw_test_raw,
+                                     "dpw_test_ema": dpw_test_em,
+                                     "lr": scheduler.get_last_lr()[0],
+                                     "skipped": n_skip,
+                                     "sec": round(time.time() - t_epoch, 1),
+                                     "at": time.time()}) + "\n")
+        if world > 1:
+            dist.barrier()   # nobody starts epoch N+1 before last.pth is on disk
+
+        if best["no_improve"] >= cfg.early_stop_patience:
+            log(f"\n🛑 early stop: no improvement for {cfg.early_stop_patience} epochs")
+            break
+
+    # A self-resubmitting job script can stop on this file, so it must be written
+    # on normal completion only — never in an exception path.
+    if is_main():
+        (out_dir / "DONE").write_text(
+            f"best_pa_mpjpe={best['overall']:.3f}\nepochs={args.epochs}\n")
+    log(f"\n🎉 done. best PA-MPJPE {best['overall']:.1f} mm -> {out_dir}")
+
+
+# ============================================================
+# CLI
+# ============================================================
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--data_root", default=os.environ.get("DATA_ROOT"))
+    p.add_argument("--output_dir", required=False,
+                   default=os.environ.get("OUTPUT_DIR"))
+    p.add_argument("--bound-scales", dest="bound_scales", action="store_true",
+                   help="squash the 68 bone scales into the MHR rig's own "
+                        "parameter_limits (widened by --scale-bound-margin). "
+                        "Off by default so --preset baseline stays "
+                        "bit-identical; ON for every new run.")
+    p.add_argument("--scale-bound-margin", dest="scale_bound_margin",
+                   type=float, default=None,
+                   help="how far to widen each rig limit (default 0.5)")
+    p.add_argument("--anomaly-safe-fallback", dest="anomaly_safe_fallback",
+                   action="store_true",
+                   help="on an anomalous batch, step on the non-FK terms "
+                        "instead of discarding the batch")
+    p.add_argument("--mhr_model_path", default=None)
+    p.add_argument("--kp_regressor_path", default=None)
+
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--batch_size", type=int, default=64,
+                   help="PER GPU. Effective batch is this times the world size.")
+    p.add_argument("--lr", type=float, default=3e-4,
+                   help="Peak LR for a single GPU; scaled by --lr-scaling.")
+    p.add_argument("--lr-scaling", choices=("linear", "sqrt", "none"), default="sqrt",
+                   help="How to scale --lr with world size. 'linear' is the "
+                        "standard rule for SGD-style large-batch training; "
+                        "'sqrt' is gentler and sometimes better for Adam.")
+    p.add_argument("--num_workers", type=int, default=9)
+    p.add_argument("--prefetch-factor", type=int, default=4)
+    p.add_argument("--samples-per-epoch", type=int, default=400_000,
+                   help="Epoch length in crops. Size it so one epoch is 30-60 "
+                        "min: a preemption costs at most one epoch.")
+    p.add_argument("--val-frac", type=float, default=0.02,
+                   help="Held-in val fraction. This is a training-health signal "
+                        "(agreement with the teacher on the same distribution), "
+                        "not a generalisation measure. 0 disables it.")
+    p.add_argument("--val-3dpw", default=os.environ.get("THREEDPW_SEQ"),
+                   help="3DPW sequenceFiles/ directory. When given, PA-MPJPE on "
+                        "J14 (adapter-applied) becomes the checkpoint-selection metric.")
+    p.add_argument("--val-3dpw-images", default=os.environ.get("THREEDPW_IMG"),
+                   help="3DPW imageFiles/ directory.")
+    p.add_argument("--val-3dpw-split", default="validation",
+                   choices=("validation", "test", "train"),
+                   help="Keep this at 'validation'. Selecting on 'test' spends "
+                        "the split a paper reports.")
+    p.add_argument("--val-3dpw-test", action="store_true",
+                   help="ALSO evaluate the 24-sequence test split each epoch and "
+                        "log it, so you can watch the number the paper will "
+                        "report. Never used for checkpoint selection.")
+    p.add_argument("--val-3dpw-test-stride", type=int, default=5)
+    p.add_argument("--val-3dpw-stride", type=int, default=5,
+                   help="3DPW is 30 fps; neighbouring frames are near-duplicates.")
+    p.add_argument("--val-3dpw-adapter",
+                   default="training/assets/adapter_j14_h36m.npz",
+                   help="Fixed MHR70->J14 map, fitted on the training annotations, "
+                        "applied before scoring. 'none' scores the raw MHR joints "
+                        "instead.")
+    p.add_argument("--cliff-focal", action="store_true",
+                   help="Perspective-correct CLIFF conditioning: angles off the "
+                        "optical axis and angular box size instead of "
+                        "image-normalised pixels. Required once the corpus "
+                        "carries real per-image focals (f/diag spans 0.6-1.8), "
+                        "where the pixel form is ambiguous and cam_trans and "
+                        "body scale come out unstable. Applies to training AND "
+                        "to the 3DPW validation crops; the two must agree.")
+    p.add_argument("--val-3dpw-gt", default="h36m",
+                   choices=("h36m", "jointpositions"),
+                   help="h36m (default) is the published protocol and needs "
+                        "gt_h36m/ next to sequenceFiles/ (see "
+                        "benchmark/make_3dpw_gt.py). jointpositions is the raw "
+                        "pickle field the runs before this flag selected on — "
+                        "several mm apart, so a resumed run must keep its own.")
+    p.add_argument("--val-landmarks", dest="val_landmarks", default="fitted",
+                   choices=("fitted", "exact"),
+                   help="Which readout the 3DPW selection metric scores. "
+                        "fitted (default) is the (70, 127) skeleton matrix the "
+                        "exported graph's consumer uses, and what every "
+                        "recorded run was selected on. exact is the teacher's "
+                        "mesh+joint mapping -- what --exact-landmarks trains "
+                        "against, and the operator the adapter was fitted "
+                        "from. Measured 0.13 mm of J14+adapter PA-MPJPE on "
+                        "3DPW test and 0.05 mm on validation, with or without "
+                        "--exact-landmarks training, so it does not move "
+                        "selection; it is an offset, and mixing the two in one "
+                        "table is what to avoid.")
+    p.add_argument("--mix", default="sqrt",
+                   help="Dataset mixture: sqrt | uniform | equal | "
+                        "'sa1b=0.4,aic=0.35,coco=0.15,mpii=0.1'.")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max_images", type=int, default=None)
+
+    p.add_argument("--w_keypoints3d", type=float, default=None)
+    p.add_argument("--w_simcc", type=float, default=None)
+    p.add_argument("--weight_decay", type=float, default=None)
+    p.add_argument("--backbone", default=None)
+    p.add_argument("--v3-lanczos", dest="v3_lanczos", action="store_true",
+                   help="--preset v3: cut the training window with Lanczos instead of "
+                        "bilinear, so training crops are as sharp as val/phone crops. "
+                        "Use for every new v3 run.")
+    p.add_argument("--image-size", dest="image_size", type=int, default=None,
+                   help="Network input side in px (default 224). A multiple of "
+                        "32: the decoder's positional grid is image_size // 32. "
+                        "Recorded in run_config.json and read back by "
+                        "config_from_checkpoint, the harnesses and the export.")
+    p.add_argument("--ema-decay", type=float, default=None)
+
+    p.add_argument("--sync-bn", action="store_true")
+    p.add_argument("--no-resume", action="store_true")
+    p.add_argument("--init-from", dest="init_from", default=None,
+                   help="Start a NEW run from this checkpoint's weights (a "
+                        "best_student_model_v3.pth or last.pth), keeping the fresh "
+                        "optimiser and schedule. Parameters the checkpoint lacks "
+                        "(--prev-token, --contact-head) keep their initialisation; "
+                        "any other missing or mismatched key raises. Ignored when "
+                        "the run resumes from its own last.pth.")
+    p.add_argument("--extend", action="store_true",
+                   help="Continue a run past the epoch count it was trained "
+                        "with: rebuild the LR schedule over the new total and "
+                        "fast-forward it. A warm restart, not the same as one "
+                        "long run -- see the note in the resume path.")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="Skip the timm download. Compute nodes have no internet, "
+                        "so run --warm-cache once on a login node instead.")
+    p.add_argument("--log-every", type=int, default=100)
+    p.add_argument("--preset", choices=["baseline", "v2", "v3", "v4"], default="baseline",
+                   help="'v2' enables the wave-1 bundle: truncation, occlusion "
+                        "and JPEG augmentation with the SimCC-mask and CLIFF "
+                        "prerequisites, plus absolute-pose supervision. "
+                        "'v3' is v2 with every crop sampled from a context-crop "
+                        "split over a wide range of framings (needs --data_root "
+                        "of build_split.py --context splits). "
+                        "'v4' gives v3's framings from precomputed windows cut "
+                        "like the runtime crop (needs a build_split.py --windows "
+                        "corpus at --image-size), v2's occlusion/JPEG, baseline "
+                        "geometry and baseline loss weights. "
+                        "'baseline' reproduces the pre-v2 trainer exactly.")
+    p.add_argument("--windows", choices=["standard", "random"], default=None,
+                   help="Read a window corpus (build_split.py --windows; --data_root "
+                        "data_win<size>) on top of any preset but v3. 'standard': "
+                        "always window 0, the runtime crop -- the baseline framing at "
+                        "any --image-size. 'random': one of the 4 windows per "
+                        "augmented sample (v4's framings: zoom-out, zoom-in, shift), "
+                        "with the box-follows-crop and off-crop-keypoint masking it "
+                        "needs. --preset v4 implies 'random'.")
+    p.add_argument("--window0-p", dest="window0_p", type=float, default=None,
+                   help="With --windows random (or --preset v4): probability of the "
+                        "standard crop (window 0); the other windows share the rest. "
+                        "Default: all 4 equally likely, i.e. 0.25.")
+    p.add_argument("--w_reproj", type=float, default=None)
+    p.add_argument("--crop-centre-fix", dest="crop_centre_fix", action="store_true",
+                   help="Divide the CLIFF crop-centre correction by the zoom. "
+                        "Only affects --preset v2 (cliff_follows_aug). Without "
+                        "it the box centre the network is told is off by 7.73 px "
+                        "mean / 21.0 px p95 at v2 zoom strength. Default "
+                        "off so generation 5 reproduces bit-for-bit.")
+    p.add_argument("--prev-token", dest="prev_token", action="store_true",
+                   help="Foot lock: an extra decoder query carrying the previous "
+                        "frame's 70 keypoints + cam_trans (withheld with "
+                        "--prev-mask-p), real pairs on Harmony4D, GT + "
+                        "noise elsewhere. Also turns on the per-foot contact head.")
+    p.add_argument("--prev-mask-p", dest="prev_mask_p", type=float, default=None)
+    p.add_argument("--prev-pairs-only", dest="prev_pairs_only", action="store_true",
+                   help="With --prev-token: withhold the previous pose on stills "
+                        "instead of feeding their own GT + noise, so it only ever "
+                        "comes from a real earlier frame (Harmony4D).")
+    p.add_argument("--contact-floor", dest="contact_floor", default=None, metavar="NPZ",
+                   help="With --prev-token: label Harmony4D contact by height above "
+                        "the per-camera floor of this table (tools/build_contact_floor.py) "
+                        "instead of by foot motion alone, which calls 42%% of its "
+                        "pairs 'both feet in the air'. Tracks without a floor keep "
+                        "the motion rule.")
+    p.add_argument("--contact-flight-weight", dest="contact_flight_weight", type=float,
+                   default=None, help="With --prev-token: contact-loss multiplier on "
+                                      "samples with both feet off the ground (default 1).")
+    p.add_argument("--w-contact", dest="w_contact", type=float, default=None)
+    p.add_argument("--w-zero-vel", dest="w_zero_vel", type=float, default=None)
+    p.add_argument("--w-foot-mocap", dest="w_foot_mocap", type=float, default=None)
+    p.add_argument("--w-verts", dest="w_verts", type=float, default=None,
+                   help="Weight on the surface (PVE) term: unsquared Euclidean "
+                        "distance, in metres, between predicted and teacher mesh "
+                        "vertices. 0 (the default) disables it and every code "
+                        "path it touches. This is the only geometric loss that "
+                        "sees shape_params, which move the skeleton by exactly "
+                        "0 cm. Try 0.35, the same scale as --preset v2's "
+                        "w_keypoints3d.")
+    p.add_argument("--n-verts", dest="n_verts", type=int, default=None,
+                   help="How many mesh vertices the surface term uses: a "
+                        "farthest-point subset of the rig's own 18,439-vertex "
+                        "mesh (default 595, lod6's count). Costs 0.6 ms per "
+                        "batch-64 step against 16.7 ms for the full mesh.")
+    p.add_argument("--early-stop-patience", dest="early_stop_patience", type=int, default=None,
+                   help="Stop after this many epochs with no improvement in the "
+                        "selection metric (config default 150). The counter is "
+                        "carried in the checkpoint, so it accumulates across "
+                        "chained links. Raise it to disable: with OneCycleLR, "
+                        "which anneals to ~0 only in the last 10%% of the planned "
+                        "epochs, a plateau at high LR can expire the patience "
+                        "just before the refinement phase that would have ended "
+                        "it -- g8r_s0 stopped at 243 of 300 that way.")
+    p.add_argument("--exact-landmarks", dest="exact_landmarks", action="store_true",
+                   help="Supervise the 70 keypoints with the teacher's exact "
+                        "mesh+joint mapping over the 468 vertices it references, "
+                        "instead of the fitted skeleton-only matrix. Changes "
+                        "loss_3d_native and loss_reproj; export is unchanged. "
+                        "Needs assets/mhr_landmarks70.npz.")
+    p.add_argument("--cont-head", dest="cont_head", action="store_true",
+                   help="Reproduce the teacher's regression pathway: the head "
+                        "emits 447 numbers in its continuous space (6D root, "
+                        "260-dim body, 28 bone-scale PCA coefficients, two "
+                        "54-dim hand blocks) through a two-layer MLP with a "
+                        "learned neutral initial estimate, and converts to the "
+                        "204-vector inside the model. Implies the rotation-matrix "
+                        "root loss. Needs assets/mhr_cont_head.npz.")
+    p.add_argument("--losses", choices=("legacy", "rebalanced"), default="legacy",
+                   help="Orthogonal to --preset, which only controls the input "
+                        "pipeline and the absolute-pose terms. 'rebalanced' applies "
+                        "the four loss-budget fixes (w_shape 1.0->0.03, pose split "
+                        "onto the non-flipped 60%% of the batch at beta 0.05, "
+                        "unsquared-Euclidean 3D loss at w 0.35, finger keypoints at "
+                        "0.2). 'legacy' reproduces the pre-rebalance recipe bit for "
+                        "bit, so b2/v2 runs in flight stay valid controls.")
+    p.add_argument("--index-cache", default=None,
+                   help="Where to cache the (image, npz) pair index. "
+                        "Default: <data_root>/.pair_index_v2.pkl")
+    p.add_argument("--rebuild-index", action="store_true",
+                   help="Rescan the corpus even if the cache looks current.")
+    p.add_argument("--warm-cache", action="store_true",
+                   help="Instantiate the backbone to populate $TORCH_HOME / "
+                        "$HF_HOME, then exit. Run where there is internet access.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Build config, dataset and sampler, print the mixture, "
+                        "then exit without training.")
+    return p.parse_args()
+
+
+def build_cfg(args):
+    cfg = T.DistillConfig()
+    if args.data_root:        cfg.data_root = args.data_root
+    if args.output_dir:       cfg.log_dir = args.output_dir
+    if args.bound_scales:          cfg.bound_scales = True
+    if args.anomaly_safe_fallback: cfg.anomaly_safe_fallback = True
+    if args.scale_bound_margin is not None:
+        cfg.scale_bound_margin = args.scale_bound_margin
+    if args.mhr_model_path:   cfg.mhr_model_path = args.mhr_model_path
+    if args.kp_regressor_path: cfg.kp_regressor_path = args.kp_regressor_path
+    cfg.batch_size = args.batch_size
+    cfg.num_workers = args.num_workers
+    cfg.max_images = args.max_images
+    cfg.epochs = args.epochs
+    cfg.per_dataset_caps = {}            # replaced by the weighted sampler
+    if args.backbone:               cfg.backbone = args.backbone
+    if args.crop_centre_fix:        cfg.crop_centre_fix = True
+    if args.cont_head:
+        cfg.cont_head = True
+        cfg.root_rot_loss = True
+    if args.exact_landmarks:        cfg.exact_landmarks = True
+    if args.early_stop_patience is not None:
+        cfg.early_stop_patience = args.early_stop_patience
+    if args.w_verts is not None:    cfg.w_verts = args.w_verts
+    if args.prev_token:
+        cfg.prev_token = cfg.contact_head = True
+        # The two Euclidean terms on loss_3d_native's 0.35 scale (rebalanced),
+        # so a foot keypoint is not pulled ~200x harder than the other 62.
+        cfg.w_contact, cfg.w_zero_vel = 0.3, 0.35
+    if args.prev_pairs_only:
+        if not args.prev_token:
+            raise SystemExit("--prev-pairs-only needs --prev-token")
+        cfg.prev_pairs_only = True
+    if args.contact_floor and not Path(args.contact_floor).is_file():
+        raise SystemExit(f"--contact-floor: no such file {args.contact_floor}")
+    for k in ("prev_mask_p", "w_contact", "w_zero_vel", "w_foot_mocap",
+              "contact_floor", "contact_flight_weight"):
+        if getattr(args, k) is not None:
+            if not args.prev_token:
+                raise SystemExit(f"--{k.replace('_', '-')} needs --prev-token")
+            setattr(cfg, k, getattr(args, k))
+    if args.n_verts is not None:    cfg.n_verts = args.n_verts
+    if args.w_simcc is not None:    cfg.w_simcc = args.w_simcc
+    if args.weight_decay is not None: cfg.weight_decay = args.weight_decay
+    if args.ema_decay is not None:  cfg.ema_decay = args.ema_decay
+    if args.v3_lanczos: cfg.v3_lanczos = True
+    if args.image_size is not None:
+        if args.image_size % 32:
+            raise SystemExit(f"--image-size {args.image_size} is not a multiple of 32")
+        cfg.image_size = args.image_size
+
+    if args.preset in ("v2", "v3"):
+        apply_v2_preset(cfg)
+    if args.preset == "v3":
+        apply_v3_preset(cfg)
+    if args.preset == "v4":
+        apply_v4_preset(cfg)
+    if args.windows:
+        if cfg.context_crops:
+            raise SystemExit("--windows replaces the input corpus; --preset v3 reads "
+                             "context crops instead")
+        apply_windows(cfg, args.windows)
+    if args.window0_p is not None:
+        if not (cfg.crop_windows and cfg.window_mode == "random"):
+            raise SystemExit("--window0-p needs --windows random or --preset v4")
+        if not 0.0 <= args.window0_p <= 1.0:
+            raise SystemExit("--window0-p must be in [0, 1]")
+        cfg.window0_p = args.window0_p
+    # Orthogonal axis: --preset is the input pipeline + absolute-pose terms,
+    # --losses is the loss budget. Applied second so it owns w_keypoints3d.
+    if args.losses == "rebalanced":
+        T.apply_rebalanced_losses(cfg)
+    # An explicit --w_reproj / --w_keypoints3d still wins over both.
+    if args.w_reproj is not None:   cfg.w_reproj = args.w_reproj
+    if args.w_keypoints3d is not None: cfg.w_keypoints3d = args.w_keypoints3d
+    # Orthogonal to both presets: it changes what the network is TOLD, not what
+    # it is trained on or scored against.
+    cfg.cliff_focal = args.cliff_focal
+    return cfg
+
+
+def apply_v2_preset(cfg) -> None:
+    """Wave-1 bundle: augmentation (MeTRAbs items 1/2/4) + absolute-pose (item 3).
+
+    Deliberately one preset rather than four independent flags. MeTRAbs measures
+    the augmentations cumulatively (Table 7: 58.0 -> 52.8 -> 49.3), so splitting
+    them into separate runs would spend three 3-seed sweeps reproducing an
+    ablation that already exists in the literature. Absolute-pose supervision
+    rides along because it touches disjoint machinery -- the reprojection and
+    translation terms, not the input pipeline -- so a regression stays
+    attributable from the per-term loss breakdown in history.jsonl.
+    """
+    # --- item 1: truncation -------------------------------------------------
+    cfg.geom_scale_max = 2.0          # retains the central quarter by area
+    cfg.geom_trans = 0.20             # off-centre, so truncation is not symmetric
+    cfg.cliff_follows_aug = True      # prerequisite B
+    cfg.mask_oob_2d = True            # prerequisite A
+    # --- item 2: occlusion --------------------------------------------------
+    cfg.occl_p = 0.7                  # MeTRAbs Table 7
+    cfg.occl_scale = (0.02, 0.30)
+    # --- item 4: JPEG -------------------------------------------------------
+    cfg.jpeg_p = 0.3
+    cfg.jpeg_quality = (30, 90)
+    # --- item 3: absolute pose ---------------------------------------------
+    cfg.w_reproj = 0.5                # was 0.01, i.e. effectively off
+    cfg.reproj_all_samples = True     # the flipped half now contributes
+    cfg.cam_loss = "euclid"
+
+
+def apply_v3_preset(cfg) -> None:
+    """v2 plus framing robustness: every crop is sampled from a context crop
+    (build_split.py --context 2.0 --body-size 448) over a wide range of
+    framings -- loose and off-centre like EMDB's and a phone detector's boxes,
+    tight and truncated like a person close to the camera -- always surrounded
+    by real scene. Applied on top of apply_v2_preset: v2's occlusion, JPEG,
+    rotation, flip and absolute-pose terms are kept; its zoom/shift (which can
+    only zoom INTO a 1.2x crop) are replaced by the context window.
+
+    Measured motivation (2026-09-25): g8h loses 12-15 mm on EMDB under EMDB's
+    own boxes, and 16 mm when our boxes are enlarged to 1.6x -- the loosest
+    framing the 1.2x corpus can show, and only with black margins."""
+    cfg.context_crops = True
+    cfg.v3_box_min, cfg.v3_box_max = 0.6, 2.0
+    cfg.v3_shift = 0.15
+    # The window's CLIFF vector is built in the perspective-correct form; the
+    # pixel form is ambiguous on this corpus's real focals. Mandatory, not a flag.
+    cfg.cliff_focal = True
+
+
+def apply_windows(cfg, mode: str) -> None:
+    """Train on a window corpus. 'standard' changes only where the crop comes
+    from (window 0 = the runtime crop, one resize from the photo), so the
+    preset's augmentation is untouched. 'random' adds v4's framings, which
+    truncate and shift the person, so it also turns on the two prerequisites
+    v2 introduced for exactly that: CLIFF follows the crop, and keypoints
+    pushed off the crop are masked out of the 2D losses."""
+    cfg.crop_windows = True
+    cfg.window_mode = mode
+    if mode == "random":
+        cfg.cliff_follows_aug = True
+        cfg.mask_oob_2d = True
+
+
+def apply_v4_preset(cfg) -> None:
+    """v3's framings without v3's texture, on baseline loss weights.
+
+    Each crop is one of K windows build_split.py --windows cut from the
+    full-resolution photo with a single resize, like the runtime crop: window 0
+    is the standard 1.2x crop, the others v3 framings. v3 cut its windows from a
+    448 px context crop with a second warp, and its models learned that texture
+    (3DPW val J14 PA, g9_b4_224 ep314: 49.3 on crops cut from the frame vs 43.6
+    on crops built its own way; g8h 40.0 vs 39.4).
+
+    On top: v2's occlusion and JPEG with the two prerequisites truncated
+    framings need, and baseline geometry (the windows already supply the zoom
+    and shift). The loss weights stay the baseline ones -- no v2 item 3."""
+    cfg.crop_windows = True
+    cfg.cliff_follows_aug = True
+    cfg.mask_oob_2d = True
+    cfg.occl_p = 0.7
+    cfg.occl_scale = (0.02, 0.30)
+    cfg.jpeg_p = 0.3
+    cfg.jpeg_quality = (30, 90)
+    cfg.cliff_focal = True
+
+
+def main():
+    args = parse_args()
+
+    if args.warm_cache:
+        cfg = build_cfg(args)
+        import timm
+        m = timm.create_model(cfg.backbone, pretrained=True, num_classes=0)
+        print(f"cached {cfg.backbone}: {sum(p.numel() for p in m.parameters())/1e6:.2f} M "
+              f"params under TORCH_HOME={os.environ.get('TORCH_HOME')} "
+              f"HF_HOME={os.environ.get('HF_HOME')}")
+        # The pair index too: this is the other thing a compute node should
+        # never have to build.
+        build_pair_index(cfg.data_root, args.index_cache,
+                         rebuild=args.rebuild_index)
+        return
+
+    rank, local_rank, world = setup_distributed()
+
+    # Distinct per rank so workers do not draw identical augmentation streams,
+    # but derived from --seed so the run stays reproducible.
+    seed = args.seed * 1000 + rank
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+    cfg = build_cfg(args)
+    if args.lr_scaling == "linear":
+        cfg.lr = args.lr * world
+    elif args.lr_scaling == "sqrt":
+        cfg.lr = args.lr * math.sqrt(world)
+    else:
+        cfg.lr = args.lr
+
+    if not args.output_dir:
+        raise SystemExit("--output_dir (or $OUTPUT_DIR) is required")
+    if not Path(cfg.kp_regressor_path).exists():
+        raise SystemExit(
+            f"keypoint regressor missing: {cfg.kp_regressor_path}\n"
+            f"It ships with the repo; if absent, fit it once with\n"
+            f"  python training/train.py "
+            f"--fit-regressor --data_root {cfg.data_root}")
+    if not Path(cfg.mhr_model_path).exists():
+        raise SystemExit(f"MHR TorchScript rig missing: {cfg.mhr_model_path}")
+
+    log("=" * 66)
+    log(f"host {socket.gethostname()} | rank {rank}/{world} (local {local_rank})")
+    log(f"data      {cfg.data_root}")
+    log(f"out       {cfg.log_dir}")
+    log(f"backbone  {cfg.backbone} | epochs {args.epochs} | "
+        f"batch {cfg.batch_size}/gpu | lr {cfg.lr:.2e} ({args.lr_scaling} x{world})")
+    log(f"preset    {args.preset}"
+        + (f" | trunc<={cfg.geom_scale_max} trans={cfg.geom_trans} "
+           f"occl_p={cfg.occl_p} jpeg_p={cfg.jpeg_p} "
+           f"w_reproj={cfg.w_reproj} cam={cfg.cam_loss}"
+           if args.preset != "baseline" else ""))
+    log(f"losses    {args.losses}"
+        + (f" | w_shape={cfg.w_shape} pose_split={cfg.pose_split} "
+           f"pose_beta={cfg.pose_beta} kp3d={cfg.kp3d_loss}@{cfg.w_keypoints3d} "
+           f"finger_w={cfg.finger_weight}"
+           if args.losses != "legacy" else ""))
+    log(f"head      {'continuous (teacher pathway, 447 dims)' if cfg.cont_head else 'linear 204-vector'}"
+        + (f" | root loss = rotation matrix" if cfg.root_rot_loss else ""))
+    log(f"landmarks {'teacher exact mapping (468 mesh vertices + 50 joints)' if cfg.exact_landmarks else 'fitted (70, 127) skeleton regressor'}")
+    log(f"surface   w_verts={cfg.w_verts}"
+        + (f" over {cfg.n_verts} mesh vertices" if cfg.w_verts > 0 else " (off)")
+        + f" | crop_centre_fix={cfg.crop_centre_fix}")
+    log(f"stability bound_scales={cfg.bound_scales}"
+        + (f" (margin {cfg.scale_bound_margin})" if cfg.bound_scales else "")
+        + f" | safe_fallback={cfg.anomaly_safe_fallback}"
+        + f" | rollback@{cfg.anomaly_skip_patience} x{cfg.max_ema_rollbacks}")
+    log(f"seed      {args.seed} | mix {args.mix} | "
+        f"samples/epoch {args.samples_per_epoch:,}")
+    log("=" * 66)
+
+    if args.dry_run:
+        build_jz_loaders(cfg, args, rank, world)
+        log("dry run OK")
+    else:
+        train(args, cfg, rank, local_rank, world)
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

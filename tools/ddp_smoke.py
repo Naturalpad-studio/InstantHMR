@@ -5,10 +5,10 @@
     python tools/ddp_smoke.py --backbone repvit_m2_3        # the control
     python tools/ddp_smoke.py --image-size 288               # a non-224 input
 
-WHY THIS EXISTS. A plain single-process smoke run -- `train_distill_jz.py` on a
+WHY THIS EXISTS. A plain single-process smoke run -- `train_ddp.py` on a
 laptop, `--self-test`, `--overfit-test` -- builds no DDP Reducer at all, so it
-cannot see the one class of failure that only exists under `srun`: a parameter
-that never receives a gradient. `52_train_ddp.slurm` runs
+cannot see the one class of failure that only exists in a multi-GPU run: a
+parameter that never receives a gradient. `train_ddp.py` under torchrun runs
 `DistributedDataParallel` with the default `find_unused_parameters=False`, which
 aborts on the SECOND optimiser step with
 
@@ -44,8 +44,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "instanthmr_distill_train"))
-import train_distill_mhr_only as T  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "training"))
+import train as T  # noqa: E402
 
 
 def main() -> int:
@@ -63,8 +63,8 @@ def main() -> int:
     p.add_argument("--data_root", default="data")
     p.add_argument("--batch_size", type=int, default=2,
                    help="Small on purpose. Which parameters receive a gradient "
-                        "does not depend on the batch size, and a Jean Zay "
-                        "LOGIN node kills a process around 3-4 GB: measured peak "
+                        "does not depend on the batch size, and a shared "
+                        "login node may kill a process around 3-4 GB: measured peak "
                         "RSS is 4.49 GB for repvit_m2_3 at batch 8 (killed) "
                         "against 2.45 GB at batch 2. Raise it only if you are on "
                         "a compute node.")
@@ -83,6 +83,9 @@ def main() -> int:
     p.add_argument("--prev-token", dest="prev_token", action="store_true",
                    help="Foot lock: the previous-pose query, the contact head and "
                         "the three foot-lock losses, all at weight 1.")
+    p.add_argument("--contact-floor", dest="contact_floor", default="",
+                   help="With --prev-token: Harmony4D contact by height (tools/build_contact_floor.py).")
+    p.add_argument("--contact-flight-weight", dest="contact_flight_weight", type=float, default=1.0)
     p.add_argument("--pretrained", action="store_true",
                    help="Load the timm weights too. Off by default: the head "
                         "geometry this checks does not depend on them.")
@@ -111,6 +114,8 @@ def main() -> int:
     if args.prev_token:
         cfg.prev_token = cfg.contact_head = True
         cfg.w_contact = cfg.w_zero_vel = cfg.w_foot_mocap = 1.0
+        cfg.contact_floor = args.contact_floor
+        cfg.contact_flight_weight = args.contact_flight_weight
     if args.backbone:
         cfg.backbone = args.backbone
     if args.image_size is not None:
