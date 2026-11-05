@@ -1,62 +1,44 @@
 # datasets_pipeline
 
-Rebuild any split of the SAM-3D-Body corpus from scratch, keeping the original
-frames this time, into the layout the training code already understands.
+Builds the training data from the released annotations of
+[SAM 3D Body](https://huggingface.co/datasets/facebook/sam-3d-body-dataset) and the original
+images of each dataset. One folder per dataset:
 
 ```
-data/sam3d_gt_<dataset>/
-├── original_images/   referenced source frames, native relative paths
-├── annotations/       <name>.npz
-├── body_crops/        <name>.png              224 square person crop
-├── hands_crops/       <name>_l.png  <name>_r.png
-└── images -> body_crops                       compat symlink
+<data root>/sam3d_gt_<dataset>/
+├── annotations/   <name>.npz    MHR parameters, camera, 2D and 3D keypoints of one person
+└── images/        <name>.png    the person crop
 ```
-
-`body_crops` is **byte-identical** to what `tools/parquet_to_npz.py` writes into
-`images/` — verified md5-for-md5 on 120 AIC crops against the existing
-`data/sam3d_gt_aic/`. `build_split.py` imports that module's crop and annotation
-builders rather than re-implementing them, so the two can never drift. The
-`images` symlink means `SAM3DStudentDataset` finds these folders with **no code
-change**; that path is tested, not assumed.
-
-## The scripts
 
 | script | does |
 |---|---|
-| `fetch_annotations.py` | parquet shards from the gated HF repo |
-| `probe_split.py` | **is this split worth its download?** — from annotations alone |
-| `fetch_images.py` | source frames, per dataset |
-| `build_split.py` | parquet + frames → the folder above |
-| `verify_split.py` | integrity, reprojection, and how much hand signal a split carries |
+| `fetch_annotations.py` | downloads the annotation shards (gated: accept the terms on Hugging Face first) |
+| `probe_split.py` | tells you what a split contains, from its annotations alone |
+| `plan_disk.py` | how much disk a split will take |
+| `fetch_images.py` | downloads the source images, or prints how to get them |
+| `build_split.py` | annotations + images -> the folder above |
+| `verify_split.py` | checks a built split |
 
-Plus `plan_disk.py` (cost a split before downloading it), `stream_archives.py`
-(build a dataset larger than your disk), `registry.py` (every URL and gotcha in
-one place), and `undistort.md`.
-
-Annotations are ~1 GB per split; frames are tens to thousands of GB. So the
-order is always: fetch annotations → `probe_split.py` → decide → fetch frames.
+`registry.py` holds every URL and per-dataset detail; `stream_archives.py` builds a dataset larger
+than your disk; `undistort.md` covers the datasets whose frames must be undistorted first.
 
 ## Quick start
 
+The released models were trained on a **window corpus**: for each person, four square crops cut
+from the full image (the standard 1.2x box crop and three other framings), stored side by side at
+288 px. COCO as an example:
+
 ```bash
-export ANN_DIR=/scratch/sam3d_ann
-export IMG_ROOT=/scratch/sam3d_img
-
-python datasets_pipeline/fetch_annotations.py --list
-python datasets_pipeline/fetch_annotations.py --splits coco_train --out $ANN_DIR
-python datasets_pipeline/plan_disk.py --annotation-dir $ANN_DIR/coco_train
-
-python datasets_pipeline/fetch_images.py --dataset coco --dest $IMG_ROOT/coco
-python datasets_pipeline/build_split.py \
-    --split coco_train \
-    --annotation-dir $ANN_DIR/coco_train \
-    --image-dir $IMG_ROOT/coco \
-    --data-root data --validate
-
-python datasets_pipeline/verify_split.py --dir data/sam3d_gt_coco
+python datasets_pipeline/fetch_annotations.py --splits coco_train --out annotations
+python datasets_pipeline/fetch_images.py --dataset coco --dest images/coco
+python datasets_pipeline/build_split.py --split coco_train \
+    --annotation-dir annotations/coco_train --image-dir images/coco \
+    --windows 4 --window-sizes 288 --no-hands --output-dir 'data_win{size}/sam3d_gt_coco'
 ```
 
-Everything is resume-safe: re-running skips crops already on disk.
+Then train with `--data_root data_win288` (see [`training/README.md`](../training/README.md)).
+Without `--windows`, `build_split.py` writes single crops into `data/sam3d_gt_<dataset>/`, which
+the trainer also reads. Every script resumes where it stopped.
 
 ## What each dataset costs, and how to get it
 

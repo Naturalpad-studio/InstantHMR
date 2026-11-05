@@ -21,9 +21,13 @@ A change to the model or a loss goes in `train.py`, so both entry points get it.
 pip install -r training/requirements.txt
 ```
 
-The MHR rig is not in git. Copy `assets/mhr_model.pt` from the
-[SAM 3D Body checkpoint](https://huggingface.co/facebook/sam-3d-body-dinov3) to
-`training/checkpoints/mhr_model.pt`, or pass `--mhr_model_path`.
+The trainer needs Meta's MHR rig, `mhr_model.pt` (Apache-2.0, 700 MB), from the
+[MHR release](https://github.com/facebookresearch/MHR/releases):
+
+```bash
+curl -L -o mhr_assets.zip https://github.com/facebookresearch/MHR/releases/latest/download/assets.zip
+mkdir -p training/checkpoints && unzip -j mhr_assets.zip assets/mhr_model.pt -d training/checkpoints
+```
 
 ## Data
 
@@ -113,15 +117,17 @@ python tools/ddp_smoke.py --backbone hgnetv2_b4 --image-size 288 \
 # The model must be able to fit 8 images.
 python training/train.py --overfit-test --data_root <data>
 
-python -m pytest -q training/test_train_ddp.py
+python -m pytest -q training
 ```
 
 ## Export to ONNX
 
 ```bash
-python tools/pth_to_onnx.py --ckpt runs/medium/best_student_model_v3.pth \
-    --output models/instanthmr_medium.onnx
+python tools/export_onnx.py --ckpt runs/medium/best_student_model_v3.pth --output models/my-model.onnx
+python tools/export_onnx.py --body --output models/mhr-body.onnx      # once, shared by every model
+python demo.py --image photo.jpg --model models/my-model.onnx
 ```
 
-The exporter reads the training settings from the `run_config.json` beside the
-checkpoint, so keep the two together.
+The first graph is the network; the second turns its MHR parameters into the 70 3D keypoints and
+the mesh, and the demo looks for it next to the model. The exporter reads the training settings
+from the `run_config.json` beside the checkpoint, so keep the two together.

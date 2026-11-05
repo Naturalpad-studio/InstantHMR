@@ -1,43 +1,14 @@
 #!/usr/bin/env python3
-# ============================================================
-# MHR-ONLY distillation — no concurrent 3D coordinate head.
-# ------------------------------------------------------------
-# SAM3D-Body (the teacher) has NO 3D and NO 2D pose head.  Its only
-# predictive modules are head_pose.proj (519 outputs = MHR params) and
-# head_camera.proj (3 outputs = s, tx, ty).  The 70 keypoints are
-# obtained as  keypoint_mapping @ [verts ; joints]  AFTER the MHR
-# forward, and the 2D ones by perspective re-projection of those 3D
-# points.  Everything is derived from the mesh.
-#
-# The student mirrors that: the 3D head is GONE and every 3D quantity
-# is derived from the MHR forward pass.  Concretely
-#
-#   mhr_params, shape_params ──► MHR skeleton (127 joints)
-#                            ──► W @ joints  = 70 native keypoints
-#
-# where W is a (70, 127) affine regressor fitted offline against the
-# teacher's own labels (see fit_keypoint_regressor / --fit-regressor).
-# Held-out residual of that fit: 1.36 mm mean / 0.005 mm median, which
-# is two orders of magnitude below the target PA-MPJPE.  Because W's
-# rows sum to exactly 1 it commutes with rigid transforms, so the
-# augmentation counter-rotations keep working unchanged.
-#
-# The 2D SimCC head is KEPT.  It is training-only (deployment re-projects
-# the MHR keypoints) but it is the only supervision that survives a
-# horizontal flip un-masked, so removing it would starve the flipped
-# half of the augmented samples.
-#
-# EXPORT CONTRACT CHANGED: the ONNX now has FOUR outputs
-#   (mhr_params, shape_params, cam_trans, joints_2d)
-# instead of five — joints_3d is gone.  instanthmr/inference.py must be
-# patched before this model can be used there; see the note on
-# HMRDeployWrapper below.
-#
-# Sanity:  python3 train.py --self-test    --data_root ../data/sam3d_gt_mpii
-#          python3 train.py --overfit-test --data_root ../data/sam3d_gt_mpii
-# Refit W: python3 train.py --fit-regressor --data_root ../data
-# Full:    python3 -u train.py --data_root /datasets/instanthmr_data --num_workers 8
-# ============================================================
+"""InstantHMR trainer: dataset, augmentation, model, MHR forward pass, losses, and a single-GPU loop.
+
+The network predicts the MHR parameters (pose, skeleton, body shape), the camera translation, and
+the 70 keypoints in 2D (SimCC). Every 3D quantity is derived from the MHR forward pass, as in
+SAM 3D Body. `train_ddp.py` imports this file for multi-GPU runs; see training/README.md.
+
+    python training/train.py --self-test --data_root data
+    python training/train.py --overfit-test --data_root data
+    python training/train.py --data_root data --output_dir runs/my_run
+"""
 import os
 
 # Must be set before the first CUDA allocation (read lazily by the allocator).
@@ -82,9 +53,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import cv2
-import onnxruntime as ort
-
-print(ort.get_available_providers())
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -1268,10 +1236,9 @@ class SAM3DStudentDataset(Dataset):
             # Where the box sits in the FIELD OF VIEW, and how large it is
             # ANGULARLY -- not in image-normalised pixels.
             #
-            # Under a fixed focal the two are interchangeable, and the corpus
-            # this trainer was written for had exactly that: every crop from
-            # tools/annotate_dataset.py carries the synthetic f = sqrt(H^2+W^2),
-            # i.e. f/diag = 1.000 with zero spread. The rebuilt corpus carries
+            # Under a fixed focal the two are interchangeable, and the first
+            # corpus had exactly that: every crop carried the synthetic
+            # f = sqrt(H^2+W^2), i.e. f/diag = 1.000 with zero spread. The corpus
             # the datasets' own focals instead, and those span f/diag 0.6-1.8 on
             # coco/aic/mpii (sd ~0.35) with harmony4d off at 0.285. There the
             # pixel version is ambiguous: two crops with identical conditioning
@@ -2821,212 +2788,6 @@ def train_instant_hmr():
     print(f"   best EMA: {best_ema_pa:.1f} mm -> {best_ema_path}")
 
 # ============================================================
-# Cell 15 — Export & Static Quantization
-# ============================================================
-class HMRDeployWrapper(nn.Module):
-    """FOUR outputs: (mhr_params, shape_params, cam_trans, joints_2d).
-
-    BREAKING CHANGE vs the earlier trainer, which exported a
-    fifth tensor `joints_3d` straight from the (now deleted) 3D head.
-
-    The MHR skeleton block cannot be folded into the ONNX graph: the TorchScript
-    artefact exposes `character_torch` as a `pymomentum...Character` object, not
-    an `nn.Module`, and torch.onnx.export refuses to trace through it
-    ("Tried to trace <...Character> but it is not part of the active trace").
-    So the 3D keypoints have to be produced by the consumer.
-
-    Required patch in instanthmr/inference.py (NOT applied here — it would add a
-    hard torch/mhr dependency to a module that is currently numpy + onnxruntime
-    only, which is not a risk-free change to make blind):
-
-      * __init__ (~l.119): the comment "Output order from export: ...,
-        joints_3d" is now wrong; assert len(out_names) == 4 and load the MHR
-        TorchScript model + training/assets/mhr_j127_to_kp70.npy.
-      * predict (~l.157-162): `joints_3d_local = outs[4][0]` must become
-
-            joints_3d_local = self._mhr_keypoints(mhr_params[None])[0]
-
-        where `_mhr_keypoints` is MHRForwardPass.get_native_keypoints from this
-        file (skeleton forward -> /100 -> negate Y,Z -> W @ joints).
-      * predict_batch (~l.239): same for `joints_3d_local_b = outs[4]`, batched.
-      * The docstrings of `InstantHMR` and `HMRPrediction` that advertise a
-        70x3 joints_3d output straight from the ONNX session.
-
-    Measured cost of that extra forward: ~0.6 ms at batch 1 and ~0.7 ms at
-    batch 8 on an RTX 4070 (no_grad, skeleton branch only, no skinning).
-    """
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def forward(self, image, cliff_cond, prev_pose=None, has_prev=None):
-        # A --prev-token graph takes the previous pose as two extra inputs and
-        # returns the per-foot contact logits as a fifth output.
-        out = self.model(image, cliff_cond, prev_pose, has_prev)
-        base = (out["mhr_params"], out["shape_params"], out["cam_trans"],
-                out["joints_2d"])
-        return base + (out["contact_logits"],) if "contact_logits" in out else base
-
-def topological_sort_onnx(model):
-    available = set()
-    for inp in model.graph.input:
-        available.add(inp.name)
-    for init in model.graph.initializer:
-        available.add(init.name)
-
-    remaining = list(model.graph.node)
-    sorted_nodes = []
-
-    while remaining:
-        progress = False
-        for node in remaining:
-            if all(inp in available or inp == '' for inp in node.input):
-                sorted_nodes.append(node)
-                remaining.remove(node)
-                for out in node.output:
-                    available.add(out)
-                progress = True
-                break
-        if not progress:
-            sorted_nodes.extend(remaining)
-            break
-
-    del model.graph.node[:]
-    model.graph.node.extend(sorted_nodes)
-    return model
-
-def export_and_quantize():
-    print("--- Exporting and Quantizing Full Model for Deployment ---")
-    try:
-        from onnxruntime.quantization import (
-            CalibrationDataReader, quantize_static,
-            QuantType, QuantFormat, CalibrationMethod,
-        )
-
-        class HMRCalibrationDataReader(CalibrationDataReader):
-            def __init__(self, dataloader, max_samples=100):
-                self.data_list = []
-                print(f"Extracting {max_samples} individual images for INT8 calibration...")
-                for batch in dataloader:
-                    images = batch["image"].numpy().astype(np.float32)
-                    cliffs = batch["cliff_cond"].numpy().astype(np.float32)
-                    for b_idx in range(images.shape[0]):
-                        if len(self.data_list) >= max_samples:
-                            break
-                        self.data_list.append({
-                            "image": images[b_idx:b_idx + 1],
-                            "cliff_cond": cliffs[b_idx:b_idx + 1]
-                        })
-                    if len(self.data_list) >= max_samples:
-                        break
-                self.enum_data = iter(self.data_list)
-
-            def get_next(self):
-                return next(self.enum_data, None)
-
-    except ImportError:
-        print("⚠️ 'onnxruntime' is not installed. INT8 quantization will fail.")
-        HMRCalibrationDataReader = None
-
-    export_dir = Path(cfg.log_dir) / "export"
-    export_dir.mkdir(parents=True, exist_ok=True)
-
-    onnx_fp32_path = export_dir / "sam3d_full_fp32.onnx"
-    onnx_fp16_path = export_dir / "sam3d_full_fp16.onnx"
-    onnx_int8_path = export_dir / "sam3d_full_int8.onnx"
-
-    output_keys = ["mhr_params", "shape_params", "cam_trans", "joints_2d"]
-    print("⚠️  Export contract: 4 outputs (joints_3d dropped). "
-          "instanthmr/inference.py needs the patch described on HMRDeployWrapper.")
-    export_target_model = InstantHMRStudent(cfg, pretrained=False).to(device)
-    best_ckpt_path = os.path.join(cfg.log_dir, "best_student_model_v3.pth")
-
-    if os.path.exists(best_ckpt_path):
-        ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=True)
-        clean_state_dict = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model_state_dict'].items()}
-        export_target_model.load_state_dict(clean_state_dict, strict=False)
-        print(f"✅ Loaded best model from epoch {ckpt.get('epoch', 0)+1}.\n")
-
-        deploy_model = HMRDeployWrapper(export_target_model)
-        deploy_model.eval()
-
-        dummy_img = torch.randn(1, 3, cfg.image_size, cfg.image_size, device=device)
-        dummy_cliff = torch.randn(1, 3, device=device)
-
-        dynamic_axes = {"image": {0: "batch"}, "cliff_cond": {0: "batch"}}
-        for k in output_keys:
-            dynamic_axes[k] = {0: "batch"}
-
-        try:
-            import onnx
-            torch.onnx.export(
-                deploy_model, (dummy_img, dummy_cliff), str(onnx_fp32_path),
-                input_names=["image", "cliff_cond"], output_names=output_keys,
-                dynamic_axes=dynamic_axes, opset_version=17
-            )
-            print(f"✅ FP32 saved: {onnx_fp32_path.name} | Size: {onnx_fp32_path.stat().st_size / 1e6:.1f} MB")
-        except Exception as e:
-            print(f"❌ FP32 export failed: {e}")
-
-        try:
-            from onnxruntime.transformers.float16 import convert_float_to_float16
-            import warnings
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                model_fp32 = onnx.load(str(onnx_fp32_path))
-                model_fp16 = convert_float_to_float16(model_fp32, keep_io_types=True)
-                model_fp16 = topological_sort_onnx(model_fp16)
-                onnx.save(model_fp16, str(onnx_fp16_path))
-            onnx.checker.check_model(onnx.load(str(onnx_fp16_path)), full_check=True)
-            print(f"✅ FP16 saved: {onnx_fp16_path.name} | Size: {onnx_fp16_path.stat().st_size / 1e6:.1f} MB")
-        except ImportError:
-            print("⚠️ FP16 skipped (onnxruntime.transformers not available)")
-        except Exception as e:
-            print(f"❌ FP16 conversion failed: {e}")
-
-        try:
-            calib_reader = HMRCalibrationDataReader(train_loader, max_samples=100)
-            calib_reader.enum_data = iter(calib_reader.data_list)
-            fp32_model = onnx.load(str(onnx_fp32_path))
-            nodes_to_exclude = []
-            for node in fp32_model.graph.node:
-                name = node.name or ''
-                if any(kw in name for kw in ['/model/transformer/', '/model/head_',
-                                              '/model/feat_proj', '/model/cond_proj']):
-                    nodes_to_exclude.append(name)
-            del fp32_model
-            print(f"  Excluding {len(nodes_to_exclude)} transformer/head nodes from quantization")
-
-            quantize_static(
-                model_input=str(onnx_fp32_path),
-                model_output=str(onnx_int8_path),
-                calibration_data_reader=calib_reader,
-                quant_format=QuantFormat.QDQ,
-                op_types_to_quantize=['Conv'],
-                per_channel=True,
-                reduce_range=False,
-                activation_type=QuantType.QInt8,
-                weight_type=QuantType.QInt8,
-                nodes_to_exclude=nodes_to_exclude,
-                calibrate_method=CalibrationMethod.Percentile,
-                extra_options={'CalibTensorRangeSymmetric': True},
-            )
-            print(f"✅ INT8 saved: {onnx_int8_path.name} | Size: {onnx_int8_path.stat().st_size / 1e6:.1f} MB")
-        except NameError:
-            print("⚠️ INT8 skipped (train_loader not available)")
-        except Exception as e:
-            import traceback
-            print(f"❌ INT8 conversion failed: {e}")
-            traceback.print_exc()
-
-        sd_path = export_dir / "sam3d_student_state_dict.pth"
-        torch.save(export_target_model.state_dict(), sd_path)
-        print(f"\n✅ PyTorch state dict saved: {sd_path.name}")
-    else:
-        print("⚠️ No checkpoint found at:", best_ckpt_path)
-
-# ============================================================
 # Self-tests
 # ============================================================
 def _mock_preds_from(batch):
@@ -3390,8 +3151,6 @@ def parse_args():
                    help="Refit the (70,127) skeleton->keypoint regressor from the dataset and exit.")
     p.add_argument("--overfit-steps", dest="overfit_steps", type=int, default=3000,
                    help="Number of steps for --overfit-test (default 3000; see run_overfit_test).")
-    p.add_argument("--no-export", dest="no_export", action="store_true",
-                   help="Skip the ONNX export / quantization step after training.")
     p.add_argument("--gpu", type=int, default=None, help="GPU count (informational).")
     p.add_argument("--exact-landmarks", dest="exact_landmarks", action="store_true",
                    help="Read the 70 keypoints out of the skinned mesh with the "
@@ -3558,9 +3317,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     train_instant_hmr()
-
-    if not args.no_export:
-        export_and_quantize()
+    print(f"Export the best checkpoint with: python tools/export_onnx.py --ckpt {cfg.log_dir}/best_student_model_v3.pth --output model.onnx")
 
 if __name__ == "__main__":
     main()

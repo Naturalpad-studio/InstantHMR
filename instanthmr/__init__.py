@@ -1,21 +1,9 @@
-"""InstantHMR — standalone 3D human pose inference + Rerun visualization."""
+"""InstantHMR: real-time 3D human mesh recovery from a single image."""
+from .inference import HMRPrediction, InstantHMR
+from .models import DEFAULT_MODEL, MODELS, resolve_model
+from .pipeline import FrameResult, PosePipeline
+from .skeleton import JOINT_NAMES, SKELETON_EDGES
 
-from .inference import InstantHMR, HMRPrediction, onnx_output_names
-from .detector import RFDETRDetector
-from .pipeline import PosePipeline, FrameResult
-from .skeleton import JOINT_NAMES, SKELETON_EDGES, NUM_JOINTS, edges_for
-
-__all__ = [
-    "InstantHMR",
-    "HMRPrediction",
-    "onnx_output_names",
-    "RFDETRDetector",
-    "PosePipeline",
-    "FrameResult",
-    "JOINT_NAMES",
-    "SKELETON_EDGES",
-    "NUM_JOINTS",
-    "edges_for",
-]
-
-__version__ = "0.1.0"
+__all__ = ["InstantHMR", "HMRPrediction", "PosePipeline", "FrameResult", "MODELS", "DEFAULT_MODEL",
+           "resolve_model", "JOINT_NAMES", "SKELETON_EDGES"]
+__version__ = "1.0.0"

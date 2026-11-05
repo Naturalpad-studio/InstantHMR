@@ -1,581 +1,183 @@
-"""ONNX inference for InstantHMR.
-
-InstantHMR takes a square person crop (224 px unless the ONNX metadata
-says otherwise) and a 3-vector CLIFF condition
-(bbox center / scale in full-frame coords) and returns mhr_params, shape,
-camera translation, and 70 joints in 2D (crop space) and 3D (camera coords,
-rig-local, metres, Y-down).
-
-This module wraps the ONNX session and the per-person preprocessing — square
-crop, CLIFF cond, ImageNet normalisation, and re-projection of joints back
-into full-frame pixels.
-
-Two graph layouts are supported, and the session tells them apart by itself:
-
-  * **5 outputs** ``(mhr_params, shape_params, cam_trans, joints_2d, joints_3d)``
-    — older students with their own 3D coordinate head (earlier trainers,
-    not in this repository).
-  * **4 outputs** ``(mhr_params, shape_params, cam_trans, joints_2d)`` — the
-    MHR-only student (``train.py``) has no 3D head, exactly
-    like the SAM3D teacher. Its 70 keypoints are derived here by running the
-    MHR skeleton forward on the predicted parameters, so such a model needs an
-    MHR backend (see :mod:`instanthmr.mhr_renderer`) passed as ``mhr=``.
-"""
-
+"""InstantHMR inference with onnxruntime: person crops in, MHR pose, 3D keypoints and mesh out."""
 from __future__ import annotations
 
+import base64
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Sequence
 
 import cv2
 import numpy as np
 
-
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-INPUT_SIZE = 224
-CROP_EXPAND = 1.2  # square crop around the detector bbox, matching training
-# Focal used when the camera is uncalibrated, as a multiple of the image
-# diagonal. A focal-aware checkpoint needs a number here whatever happens --
-# the conditioning is an ANGLE, so there is no "unknown" to pass. 1.05x diag
-# (~50 degrees horizontal FOV on 16:9) is the usual stand-in for a phone or
-# webcam; pass the real value through `focal=` whenever it is known.
-#
-# It applies to focal-aware graphs ONLY. A pixel-conditioned checkpoint was
-# trained on a corpus whose annotations set f = sqrt(H^2+W^2) exactly (see
-# tools/annotate_dataset.py), so 1.0x diag IS that model's camera and using
-# anything else would put a 5% error into its rendered depth.
+CROP_EXPAND = 1.2
+# Focal used when the camera is not calibrated, as a multiple of the image diagonal
+# (about 50 degrees of horizontal field of view on a 16:9 frame).
 FOCAL_FALLBACK_DIAG = 1.05
-
-
-def onnx_output_names(onnx_path: str | Path) -> Optional[list[str]]:
-    """Read a graph's output names without creating an inference session.
-
-    Lets a caller know whether it must supply an MHR backend *before* paying for
-    session creation and detector loading. Returns ``None`` when the ``onnx``
-    package is unavailable or the file cannot be parsed — callers should then
-    fall back to letting :class:`InstantHMR` decide.
-    """
-    try:
-        import onnx
-
-        model = onnx.load(str(onnx_path), load_external_data=False)
-        return [o.name for o in model.graph.output]
-    except Exception:  # noqa: BLE001 — purely advisory
-        return None
+DEVICES = ("cuda", "tensorrt", "cpu", "coreml")
 
 
 @dataclass
 class HMRPrediction:
-    """Per-person outputs from one InstantHMR forward pass.
+    """One person. Pixel coordinates are in the full frame; 3D is in metres, camera axes
+    (x right, y down, z forward), with `*_local` centred on the body and `*_cam` in camera space."""
 
-    All numpy, all in the FULL-frame coordinate system.
-
-    Attributes:
-        bbox: (4,) raw detector bbox [x1, y1, x2, y2].
-        confidence: detection confidence in [0, 1].
-        joints_3d_local: (70, 3) rig-local joints, metres, Y-down. Either read
-            straight from the model's 3D head, or regressed from the MHR
-            skeleton when the graph has no such head.
-        joints_3d_cam: (70, 3) joints in camera space (= local + cam_trans).
-        joints_2d: (70, 2) joints projected into full-frame pixel coords.
-        cam_trans: (3,) camera translation [tx, ty, tz], metres.
-        focal_length: (2,) [fx, fy] full-frame focal in pixels -- the camera
-            this prediction is expressed in. The real focal when one was
-            supplied, else the diagonal stand-in ``_focal_px`` picks.
-        principal_point: (2,) [cx, cy] = full-frame centre.
-        image_shape: (H, W) of the source frame.
-        mhr_params: (204,) MHR pose parameters (34 joints × 6-D rotation).
-            Pass to ``instanthmr.mhr_renderer.MHRRenderer.forward()``
-            together with ``shape_params`` to obtain a full body mesh.
-        shape_params: (45,) MHR identity blend-shape coefficients
-            (20 body + 20 head + 5 hand). Pair with ``mhr_params`` and
-            feed both into ``MHRRenderer.forward()``.
-    """
-
-    bbox: np.ndarray
+    bbox: np.ndarray                    # (4,) x1, y1, x2, y2
     confidence: float
-    joints_3d_local: np.ndarray
-    joints_3d_cam: np.ndarray
-    joints_2d: np.ndarray
-    cam_trans: np.ndarray
-    focal_length: np.ndarray
-    principal_point: np.ndarray
-    image_shape: tuple[int, int]
-    mhr_params: np.ndarray
-    shape_params: np.ndarray
-    contact_prob: Optional[np.ndarray] = None   # (2,) [left, right] foot, prev-token graphs only
+    joints_2d: np.ndarray               # (70, 2) pixels
+    joints_3d_local: np.ndarray         # (70, 3)
+    cam_trans: np.ndarray               # (3,)
+    mhr_params: np.ndarray              # (204,) MHR model parameters
+    shape_params: np.ndarray            # (45,) MHR identity coefficients
+    focal_length: float                 # pixels, the camera the 3D is expressed in
+    image_shape: tuple[int, int]        # (H, W)
+    vertices_local: np.ndarray          # (18439, 3)
 
-    def prev_pose(self) -> np.ndarray:
-        """This prediction encoded as a prev-token graph's ``prev_pose`` input:
-        the 70 rig-local keypoints, then ``cam_trans`` as (x/z, y/z, log z)."""
-        t = self.cam_trans
-        z = max(float(t[2]), 0.1)
-        return np.concatenate([self.joints_3d_local.reshape(-1),
-                               [t[0] / z, t[1] / z, math.log(z)]]).astype(np.float32)
+    @property
+    def joints_3d_cam(self) -> np.ndarray:
+        return self.joints_3d_local + self.cam_trans
+
+    @property
+    def vertices_cam(self) -> np.ndarray:
+        return self.vertices_local + self.cam_trans
+
+
+def providers_for(device: str, max_batch: int = 1, image_size: int = 288,
+                  cache_dir: str | Path = "models/trt_cache") -> list:
+    """onnxruntime execution providers for a device name, always ending on the CPU."""
+    import onnxruntime as ort
+
+    available = set(ort.get_available_providers())
+    if device == "tensorrt":
+        try:
+            import tensorrt_libs  # noqa: F401  (loads libnvinfer for onnxruntime)
+        except ImportError as e:
+            raise RuntimeError("TensorRT is not installed: pip install tensorrt-cu12==10.15.*") from e
+        if "TensorrtExecutionProvider" not in available:
+            raise RuntimeError("this onnxruntime build has no TensorRT support: install onnxruntime-gpu")
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        shape = lambda n: f"image:{n}x3x{image_size}x{image_size},cliff_cond:{n}x3"  # noqa: E731
+        trt = {"trt_fp16_enable": True, "trt_engine_cache_enable": True, "trt_engine_cache_path": str(cache_dir),
+               "trt_timing_cache_enable": True, "trt_profile_min_shapes": shape(1),
+               "trt_profile_opt_shapes": shape(max_batch), "trt_profile_max_shapes": shape(max_batch)}
+        return [("TensorrtExecutionProvider", trt), "CUDAExecutionProvider", "CPUExecutionProvider"]
+    if device == "cuda":
+        if "CUDAExecutionProvider" not in available:
+            raise RuntimeError("CUDA is not available in this onnxruntime build: install onnxruntime-gpu")
+        return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    if device == "coreml" and "CoreMLExecutionProvider" in available:
+        return ["CoreMLExecutionProvider", "CPUExecutionProvider"]
+    return ["CPUExecutionProvider"]
 
 
 class InstantHMR:
-    """ONNX wrapper for the InstantHMR model.
+    """An exported InstantHMR network and the MHR body graph that turns its output into 3D.
 
-    Args:
-        onnx_path: path to the exported graph.
-        device: ``"cuda"``, ``"coreml"`` or ``"cpu"``.
-        providers: explicit onnxruntime execution providers (overrides *device*).
-        mhr: MHR backend used to derive ``joints_3d`` when the graph has no 3D
-            head. Any object exposing ``keypoints(mhr_params, shape_params)``
-            works; see :func:`instanthmr.mhr_renderer.build_mhr`. Ignored for
-            5-output graphs.
-        focal: the camera's focal length in pixels, when it is known. Used by
-            the focal-aware conditioning and reported back in
-            ``HMRPrediction.focal_length``. Left unset, an uncalibrated
-            stand-in of ``FOCAL_FALLBACK_DIAG * sqrt(H^2+W^2)`` is used.
-        cliff_focal: which conditioning form the checkpoint was trained with.
-            Read from the ONNX metadata that ``tools/pth_to_onnx.py`` stamps,
-            so it normally needs no setting; pass it explicitly for a graph
-            exported before that existed.
-
-    Example
-    -------
-        hmr = InstantHMR("models/instanthmr.onnx")
-        out = hmr.predict(image_rgb, bbox=[x1, y1, x2, y2])
-        print(out.joints_3d_cam.shape)   # (70, 3)
+    `device` runs the network ("cuda", "tensorrt", "cpu" or "coreml"); the body graph runs on
+    CUDA when the network does, else on the CPU. `focal` is the camera focal length in pixels
+    when it is known; otherwise 1.05 x the image diagonal is assumed. `max_batch` is the most
+    people predicted in one call (TensorRT builds its engine for batches up to it).
     """
 
-    def __init__(
-        self,
-        onnx_path: str | Path,
-        device: str = "cuda",
-        providers: Optional[list[str]] = None,
-        mhr: object | None = None,
-        focal: float | None = None,
-        cliff_focal: bool | None = None,
-    ):
+    def __init__(self, model_path: str | Path, body_path: str | Path | None = None, device: str = "cuda",
+                 focal: float | None = None, max_batch: int = 4):
         import onnxruntime as ort
 
-        onnx_path = Path(onnx_path)
-        if not onnx_path.exists():
-            raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
+        from .models import resolve_body
 
-        # ORT >= 1.19 ships preload_dlls() which discovers CUDA / cuDNN
-        # bundled by the nvidia-* pip wheels (or by torch) and adds them to
-        # the loader's search path.  Calling it before session creation is
-        # the simplest fix for "libcudnn.so.9: cannot open shared object
-        # file" on machines that don't ship system CUDA.
+        if device not in DEVICES:
+            raise ValueError(f"device must be one of {DEVICES}")
         if hasattr(ort, "preload_dlls"):
-            try:
-                ort.preload_dlls()
-            except Exception:
-                # preload_dlls is best-effort — never let it block init.
-                pass
+            ort.preload_dlls()
+        ort.set_default_logger_severity(3)
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        options.log_severity_level = 3
 
-        if providers is None:
-            providers = self._default_providers(device)
-
-        sess_options = ort.SessionOptions()
-        sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        # 0 == let ORT pick. We don't override threading on CUDA (compute
-        # is on-device); on CPU/CoreML, ORT's defaults are saner than ours.
-
-        self.session = ort.InferenceSession(
-            str(onnx_path), sess_options=sess_options, providers=providers,
-        )
-        self.active_provider = self.session.get_providers()[0]
-
-        in_names = [i.name for i in self.session.get_inputs()]
-        out_names = [o.name for o in self.session.get_outputs()]
-        self._in_image = in_names[0]   # "image"
-        self._in_cliff = in_names[1]   # "cliff_cond"
-        # Output order from export: mhr_params, shape_params, cam_trans,
-        # joints_2d[, joints_3d]. The MHR-only student stops after joints_2d.
-        self._out_names = out_names
-        # A --prev-token graph (tools/pth_to_onnx.py) also takes prev_pose and
-        # has_prev, and returns contact_logits instead of a joints_3d head.
-        self.has_prev_input = "prev_pose" in in_names
-        self._prev_dim = self.session.get_inputs()[2].shape[1] if self.has_prev_input else 0
-        self.has_joints_3d_head = "joints_3d" in out_names or (
-            len(out_names) >= 5 and "contact_logits" not in out_names)
-        self._mhr = mhr
-
-        # Two independent things, and conflating them is what made this wrong:
-        #
-        #   cliff_focal -- WHICH conditioning form the checkpoint was trained
-        #     with. Angles off the optical axis, or image-normalised pixels.
-        #     The vector is 3 floats either way, so feeding a model the wrong
-        #     one raises nothing; it silently mis-places the person in depth.
-        #     tools/pth_to_onnx.py stamps it into the graph metadata, so a
-        #     freshly exported model configures itself.
-        #   focal -- WHAT the camera's focal length is, in pixels. Only used by
-        #     the angular form. Unknown is not an option there, so an
-        #     uncalibrated camera falls back to FOCAL_FALLBACK_DIAG * diagonal.
-        #
-        # Passing `focal=` alone still implies the angular form, which is how
-        # this argument behaved before `cliff_focal` existed.
-        meta = self.session.get_modelmeta().custom_metadata_map or {}
-        # The crop side the graph was trained at: stamped by tools/pth_to_onnx.py,
-        # else the graph's static input height, else the historical 224.
-        dim = self.session.get_inputs()[0].shape[2]
-        self.input_size = int(meta.get("image_size")
-                              or (dim if isinstance(dim, int) else INPUT_SIZE))
-        if cliff_focal is None:
-            cliff_focal = (str(meta.get("cliff_focal", "")).lower() == "true"
-                           or focal is not None)
-        self.cliff_focal = bool(cliff_focal)
+        size = 288
+        if device == "tensorrt":   # the engine profile needs the crop size before the session exists
+            probe = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+            size = int(probe.get_modelmeta().custom_metadata_map.get("image_size", size))
+            del probe
+        self.network = ort.InferenceSession(str(model_path), sess_options=options,
+                                            providers=providers_for(device, max_batch, size))
+        self.provider = self.network.get_providers()[0]
+        meta = self.network.get_modelmeta().custom_metadata_map
+        self.input_size = int(meta.get("image_size", size))
+        self.cliff_focal = meta.get("cliff_focal", "true") == "true"
         self.focal = focal
+        self.max_batch = max_batch
 
-    def _focal_px(self, h: int, w: int, focal: float | None = None) -> float:
-        """The camera focal in pixels: this call's, the session's, or a
-        stand-in -- in that order."""
+        body_path = Path(body_path) if body_path else resolve_body(Path(model_path))
+        self.body = ort.InferenceSession(str(body_path), sess_options=options,
+                                         providers=providers_for("cuda" if device in ("cuda", "tensorrt") else "cpu"))
+        self.faces = np.frombuffer(base64.b64decode(self.body.get_modelmeta().custom_metadata_map["mesh_faces"]),
+                                   "<i4").reshape(-1, 3)
+
+    def focal_px(self, h: int, w: int, focal: float | None = None) -> float:
         f = focal if focal is not None else self.focal
         if f is not None:
             return float(f)
-        diag = math.sqrt(h * h + w * w)
-        return (FOCAL_FALLBACK_DIAG * diag) if self.cliff_focal else diag
+        return (FOCAL_FALLBACK_DIAG if self.cliff_focal else 1.0) * math.hypot(h, w)
 
-    def _feeds(self, crops: np.ndarray, cliffs: np.ndarray,
-               prev: Optional[list] = None) -> dict:
-        """Session inputs; for a prev-token graph, ``prev[i]`` is person i's
-        ``HMRPrediction.prev_pose()`` from an earlier frame, or None = withheld."""
-        feeds = {self._in_image: crops, self._in_cliff: cliffs}
-        if self.has_prev_input:
-            n = crops.shape[0]
-            pp = np.zeros((n, self._prev_dim), dtype=np.float32)
-            hp = np.zeros((n,), dtype=np.float32)
-            for i, v in enumerate((prev or [])[:n]):
-                if v is not None:
-                    pp[i], hp[i] = v, 1.0
-            feeds["prev_pose"], feeds["has_prev"] = pp, hp
-        return feeds
-
-    def _contact(self, outs: list, i: int) -> Optional[np.ndarray]:
-        if "contact_logits" not in self._out_names:
-            return None
-        z = outs[self._out_names.index("contact_logits")][i].astype(np.float32)
-        return 1.0 / (1.0 + np.exp(-z))
-
-    @property
-    def derives_joints_3d(self) -> bool:
-        """True when the 70 keypoints must come from an MHR forward pass."""
-        return not self.has_joints_3d_head
-
-    def set_mhr(self, mhr: object | None) -> None:
-        """Attach (or replace) the MHR backend used to derive ``joints_3d``."""
-        self._mhr = mhr
-
-    def _joints_3d(self, mhr_params: np.ndarray, shape_params: np.ndarray) -> np.ndarray:
-        """Regress the 70 keypoints from predicted MHR parameters.
-
-        Mirrors ``train.MHRForwardPass.get_native_keypoints``:
-        skeleton forward, cm -> m, Y/Z flip, then the (70, 127) affine map. The
-        student was trained through exactly this operator, so any other
-        keypoint definition would silently shift the predictions.
-        """
-        if self._mhr is None:
-            raise RuntimeError(
-                "this ONNX graph has no 'joints_3d' output — it comes from "
-                "train.py, where the 3D keypoints are derived from "
-                "the MHR forward pass.\n"
-                "Pass an MHR backend, e.g.\n"
-                "    from instanthmr.mhr_renderer import build_mhr\n"
-                "    InstantHMR(onnx, mhr=build_mhr(script_path='checkpoints/mhr_model.pt'))\n"
-                "or run demo.py with --mhr-model / --mhr-assets."
-            )
-        return np.asarray(
-            self._mhr.keypoints(mhr_params, shape_params), dtype=np.float32,
-        )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def predict(
-        self,
-        image_rgb: np.ndarray,
-        bbox: np.ndarray | list[float],
-        confidence: float = 1.0,
-        focal: float | None = None,
-        prev: Optional[np.ndarray] = None,
-    ) -> HMRPrediction:
-        """Run InstantHMR on a single person.
-
-        Args:
-            image_rgb: (H, W, 3) uint8 RGB full-frame image.
-            bbox: tight person bbox [x1, y1, x2, y2] in pixel coords.
-            confidence: detection confidence to attach to the output.
-            focal: this frame's focal length in pixels, overriding the one
-                given to the constructor. Use it when the focal varies per
-                image, as it does across calibrated benchmark sequences.
-            prev: prev-token graphs only, this person's earlier
-                ``HMRPrediction.prev_pose()``; None withholds it.
-
-        Returns:
-            ``HMRPrediction`` with joints in full-frame coordinates.
-        """
-        image_rgb = np.ascontiguousarray(image_rgb)
-        h, w = image_rgb.shape[:2]
-        bbox_arr = np.asarray(bbox, dtype=np.float32).reshape(4)
-
-        crop, sq_x1, sq_y1, sq_size, cliff_cond = self._preprocess(
-            image_rgb, bbox_arr, h, w, focal
-        )
-
-        outs = self.session.run(
-            None,
-            # (1, 3, S, S) with S = self.input_size, and (1, 3)
-            self._feeds(crop[np.newaxis], cliff_cond[np.newaxis], [prev]),
-        )
-        # Order: mhr_params, shape_params, cam_trans, joints_2d[, joints_3d]
-        mhr_params = outs[0][0].astype(np.float32)
-        shape_params = outs[1][0].astype(np.float32)
-        cam_trans = outs[2][0].astype(np.float32)
-        joints_2d_norm = outs[3][0].astype(np.float32)    # (70, 2) in [-1, 1]
-        if self.has_joints_3d_head:
-            joints_3d_local = outs[4][0].astype(np.float32)   # (70, 3) rig-local
-        else:
-            joints_3d_local = self._joints_3d(mhr_params, shape_params)
-
-        # Re-project the 2D head from normalised crop space → full-frame pixels.
-        crop_px = (joints_2d_norm + 1.0) * 0.5 * self.input_size
-        scale = sq_size / self.input_size
-        joints_2d = np.stack(
-            [crop_px[:, 0] * scale + sq_x1, crop_px[:, 1] * scale + sq_y1],
-            axis=-1,
-        ).astype(np.float32)
-
-        joints_3d_cam = joints_3d_local + cam_trans
-
-        # Report the focal actually used, so anything that unprojects or
-        # renders these joints uses the same camera the model was conditioned on.
-        f = self._focal_px(h, w, focal)
-        focal_length = np.array([f, f], dtype=np.float32)
-        principal_point = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-
-        return HMRPrediction(
-            bbox=bbox_arr,
-            confidence=float(confidence),
-            joints_3d_local=joints_3d_local,
-            joints_3d_cam=joints_3d_cam,
-            joints_2d=joints_2d,
-            cam_trans=cam_trans,
-            focal_length=focal_length,
-            principal_point=principal_point,
-            image_shape=(h, w),
-            mhr_params=mhr_params,
-            shape_params=shape_params,
-            contact_prob=self._contact(outs, 0),
-        )
-
-    def predict_batch(
-        self,
-        image_rgb: np.ndarray,
-        detections: list[dict],
-        padded_to: int | None = None,
-        focal: float | None = None,
-        prev: Optional[list] = None,
-    ) -> list[HMRPrediction]:
-        """Run InstantHMR on multiple persons in a single ONNX call.
-
-        Args:
-            image_rgb: (H, W, 3) uint8 RGB full-frame image.
-            detections: list of ``{"bbox": [x1,y1,x2,y2], "confidence": f}``.
-            padded_to: when set, the ONNX batch dimension is always this size
-                (zero-padded if fewer detections).  Keeping a constant batch
-                size prevents CUDA from re-compiling kernels each time the
-                person count changes.
-            focal: this frame's focal length in pixels, overriding the one
-                given to the constructor.
-            prev: prev-token graphs only, one earlier
-                ``HMRPrediction.prev_pose()`` (or None) per detection.
-
-        Returns:
-            One ``HMRPrediction`` per input detection, in the same order.
-        """
-        if not detections:
+    def predict(self, image_rgb: np.ndarray, bboxes: Sequence, confidences: Sequence[float] | None = None,
+                focal: float | None = None) -> list[HMRPrediction]:
+        """All people of one frame in a single call. `bboxes` are tight person boxes, x1 y1 x2 y2."""
+        if len(bboxes) == 0:
             return []
-
-        image_rgb = np.ascontiguousarray(image_rgb)
         h, w = image_rgb.shape[:2]
-        n = len(detections)
-        batch = max(padded_to or n, n)  # always >= n; zero-pad the rest
+        f = self.focal_px(h, w, focal)
+        crops, cliffs, squares = zip(*(self._preprocess(image_rgb, np.asarray(b, np.float32), f) for b in bboxes))
+        crops, cliffs = np.stack(crops), np.stack(cliffs)
+        chunks = [self._run(crops[i:i + self.max_batch], cliffs[i:i + self.max_batch])
+                  for i in range(0, len(crops), self.max_batch)]
+        outs = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
+        confidences = confidences if confidences is not None else [1.0] * len(bboxes)
 
-        # Use zeros so padded slots produce deterministic (discarded) outputs.
-        crops = np.zeros((batch, 3, self.input_size, self.input_size), dtype=np.float32)
-        cliffs = np.zeros((batch, 3), dtype=np.float32)
-        sq_meta = []  # per-person (sq_x1, sq_y1, sq_size, bbox)
-        for i, det in enumerate(detections):
-            bbox_arr = np.asarray(det["bbox"], dtype=np.float32).reshape(4)
-            crop, sq_x1, sq_y1, sq_size, cliff = self._preprocess(
-                image_rgb, bbox_arr, h, w, focal,
-            )
-            crops[i] = crop
-            cliffs[i] = cliff
-            sq_meta.append((sq_x1, sq_y1, sq_size, bbox_arr))
-
-        outs = self.session.run(None, self._feeds(crops, cliffs, prev))
-        mhr_params_b = outs[0].astype(np.float32, copy=False)
-        shape_params_b = outs[1].astype(np.float32, copy=False)
-        cam_trans_b = outs[2].astype(np.float32, copy=False)
-        joints_2d_norm_b = outs[3].astype(np.float32, copy=False)
-        if self.has_joints_3d_head:
-            joints_3d_local_b = outs[4].astype(np.float32, copy=False)
-        else:
-            # One batched MHR skeleton forward for the whole frame (~0.9 ms),
-            # including the zero-padded slots — they are discarded below.
-            joints_3d_local_b = self._joints_3d(mhr_params_b, shape_params_b)
-
-        f = self._focal_px(h, w, focal)
-        focal_length = np.array([f, f], dtype=np.float32)
-        principal_point = np.array([w / 2.0, h / 2.0], dtype=np.float32)
-
-        results: list[HMRPrediction] = []
-        for i, det in enumerate(detections):
-            sq_x1, sq_y1, sq_size, bbox_arr = sq_meta[i]
-            joints_2d_norm = joints_2d_norm_b[i]
-            joints_3d_local = joints_3d_local_b[i]
-            cam_trans = cam_trans_b[i]
-
-            crop_px = (joints_2d_norm + 1.0) * 0.5 * self.input_size
-            scale = sq_size / self.input_size
-            joints_2d = np.stack(
-                [crop_px[:, 0] * scale + sq_x1, crop_px[:, 1] * scale + sq_y1],
-                axis=-1,
-            ).astype(np.float32)
-
+        results = []
+        for i, (x0, y0, side) in enumerate(squares):
+            j2d = (outs["joints_2d"][i] + 1.0) * 0.5 * side + np.array([x0, y0], np.float32)
             results.append(HMRPrediction(
-                bbox=bbox_arr,
-                confidence=float(det.get("confidence", 1.0)),
-                joints_3d_local=joints_3d_local,
-                joints_3d_cam=joints_3d_local + cam_trans,
-                joints_2d=joints_2d,
-                cam_trans=cam_trans,
-                focal_length=focal_length,
-                principal_point=principal_point,
-                image_shape=(h, w),
-                mhr_params=mhr_params_b[i],
-                shape_params=shape_params_b[i],
-                contact_prob=self._contact(outs, i),
-            ))
+                bbox=np.asarray(bboxes[i], np.float32), confidence=float(confidences[i]),
+                joints_2d=j2d.astype(np.float32), joints_3d_local=outs["joints_3d"][i],
+                cam_trans=outs["cam_trans"][i], mhr_params=outs["mhr_params"][i],
+                shape_params=outs["shape_params"][i], focal_length=f, image_shape=(h, w),
+                vertices_local=outs["vertices"][i]))
         return results
 
-    def warmup(self, max_batch_size: int = 1) -> None:
-        """Pre-warm the ONNX session for the two batch sizes used at runtime.
+    def _run(self, crops: np.ndarray, cliffs: np.ndarray) -> dict[str, np.ndarray]:
+        names = ["mhr_params", "shape_params", "cam_trans", "joints_2d"]
+        outs = dict(zip(names, self.network.run(names, {"image": crops, "cliff_cond": cliffs})))
+        outs.update(zip(["joints_3d", "vertices"], self.body.run(
+            ["joints_3d", "vertices"], {"mhr_params": outs["mhr_params"], "shape_params": outs["shape_params"]})))
+        return outs
 
-        With the padded-batch strategy the pipeline only ever calls the session
-        with batch=1 (single person) or batch=max_batch_size (multi-person,
-        zero-padded to a fixed size).  Two runs here compile all CUDA kernels
-        upfront so no mid-demo stall occurs when persons first appear.
-        """
-        dummy_image = np.zeros(
-            (max_batch_size, 3, self.input_size, self.input_size), dtype=np.float32
-        )
-        dummy_cliff = np.zeros((max_batch_size, 3), dtype=np.float32)
-        # Large batch first — allocates the most memory; batch=1 reuses the plan.
-        self.session.run(None, self._feeds(dummy_image, dummy_cliff))
-        if max_batch_size > 1:
-            self.session.run(None, self._feeds(dummy_image[:1], dummy_cliff[:1]))
+    def warmup(self, max_batch: int = 1) -> None:
+        for n in sorted({1, max_batch}):
+            self.network.run(None, {"image": np.zeros((n, 3, self.input_size, self.input_size), np.float32),
+                                    "cliff_cond": np.zeros((n, 3), np.float32)})
+            self.body.run(None, {"mhr_params": np.zeros((n, 204), np.float32),
+                                 "shape_params": np.zeros((n, 45), np.float32)})
 
-    # ------------------------------------------------------------------
-    # Preprocessing
-    # ------------------------------------------------------------------
-
-    def _preprocess(
-        self,
-        image_rgb: np.ndarray,
-        bbox: np.ndarray,
-        h: int,
-        w: int,
-        focal: float | None = None,
-    ) -> tuple[np.ndarray, float, float, float, np.ndarray]:
-        """Square 1.2x crop, ImageNet normalise, and CLIFF conditioning."""
-        x1, y1, x2, y2 = bbox.astype(float)
-        bw = x2 - x1
-        bh = y2 - y1
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-
-        # CLIFF conditioning vector (full-frame coords). Must match the variant
-        # the checkpoint was TRAINED with -- see `cliff_focal` in
-        # training/train.py. A model trained
-        # with the focal-aware form and run with the pixel form (or the other
-        # way round) does not error; it silently mis-places the person in depth.
+    def _preprocess(self, image_rgb: np.ndarray, bbox: np.ndarray, focal: float):
+        """The square 1.2x crop the model was trained on, and its CLIFF conditioning vector."""
+        h, w = image_rgb.shape[:2]
+        x1, y1, x2, y2 = bbox.astype(np.float64)
+        cx, cy, size = (x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1)
         if self.cliff_focal:
-            f = self._focal_px(h, w, focal)
-            cliff_cond = np.array([math.atan((cx - w / 2.0) / f),
-                                   math.atan((cy - h / 2.0) / f),
-                                   max(bw, bh) / f], dtype=np.float32)
+            cliff = [math.atan((cx - w / 2) / focal), math.atan((cy - h / 2) / focal), size / focal]
         else:
-            cx_norm = 2.0 * (cx / w) - 1.0
-            cy_norm = 2.0 * (cy / h) - 1.0
-            b_scale = max(bw, bh) / max(w, h)
-            cliff_cond = np.array([cx_norm, cy_norm, b_scale], dtype=np.float32)
+            cliff = [2 * cx / w - 1, 2 * cy / h - 1, size / max(w, h)]
 
-        sq_size = max(bw, bh) * CROP_EXPAND
-        half = sq_size / 2.0
-        sq_x1 = cx - half
-        sq_y1 = cy - half
-
-        ix1 = int(math.floor(sq_x1))
-        iy1 = int(math.floor(sq_y1))
-        ix2 = int(math.ceil(sq_x1 + sq_size))
-        iy2 = int(math.ceil(sq_y1 + sq_size))
-
-        pad_left = max(0, -ix1)
-        pad_top = max(0, -iy1)
-        pad_right = max(0, ix2 - w)
-        pad_bottom = max(0, iy2 - h)
-
-        src_x1 = max(0, ix1)
-        src_y1 = max(0, iy1)
-        src_x2 = min(w, ix2)
-        src_y2 = min(h, iy2)
-
-        patch = image_rgb[src_y1:src_y2, src_x1:src_x2]
-        if pad_left or pad_top or pad_right or pad_bottom:
-            patch = cv2.copyMakeBorder(
-                patch, pad_top, pad_bottom, pad_left, pad_right,
-                cv2.BORDER_CONSTANT, value=(0, 0, 0),
-            )
-
-        crop_sq = cv2.resize(patch, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
-        crop = crop_sq.astype(np.float32) / 255.0
-        crop = (crop - IMAGENET_MEAN) / IMAGENET_STD
-        crop = np.transpose(crop, (2, 0, 1)).astype(np.float32)  # (3, S, S)
-
-        return crop, float(sq_x1), float(sq_y1), float(sq_size), cliff_cond
-
-    # ------------------------------------------------------------------
-    # Provider selection
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _default_providers(device: str) -> list[str]:
-        """Pick ORT execution providers based on the requested *device*.
-
-        Recognised values:
-            ``"cuda"``    → ``CUDAExecutionProvider`` (NVIDIA).
-            ``"coreml"``  → ``CoreMLExecutionProvider`` (Apple Silicon / macOS).
-            ``"cpu"`` / anything else → CPU only.
-
-        ``CPUExecutionProvider`` is always appended as a fallback so a
-        partially-supported model still loads.
-
-        TensorRT is intentionally **not** requested by default: the wheel
-        distinction between ``onnxruntime-gpu`` and the ``tensorrt`` system
-        libraries is fiddly, and asking for an EP whose runtime libraries
-        aren't installed produces a verbose error before falling back.
-        Pass ``providers=`` explicitly if you want TensorRT.
-        """
-        import onnxruntime as ort
-
-        available = set(ort.get_available_providers())
-        wanted: list[str] = []
-        device_l = device.lower()
-        if "cuda" in device_l and "CUDAExecutionProvider" in available:
-            wanted.append("CUDAExecutionProvider")
-        elif "coreml" in device_l and "CoreMLExecutionProvider" in available:
-            wanted.append("CoreMLExecutionProvider")
-        wanted.append("CPUExecutionProvider")
-        return wanted
+        side = size * CROP_EXPAND
+        sx, sy = cx - side / 2, cy - side / 2
+        ix1, iy1 = math.floor(sx), math.floor(sy)
+        ix2, iy2 = math.ceil(sx + side), math.ceil(sy + side)
+        patch = image_rgb[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)]
+        patch = cv2.copyMakeBorder(patch, max(0, -iy1), max(0, iy2 - h), max(0, -ix1), max(0, ix2 - w),
+                                   cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        crop = cv2.resize(patch, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
+        crop = ((crop.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1)
+        return np.ascontiguousarray(crop), np.asarray(cliff, np.float32), (float(sx), float(sy), float(side))

@@ -1,58 +1,26 @@
-# Byte-compiled / cache
 __pycache__/
 *.py[cod]
-*$py.class
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Editor / OS
 .vscode/
 .idea/
 .DS_Store
-
-# Virtual environments
 .venv/
 venv/
-env/
 
-# RF-DETR auto-downloaded weights
-rf-detr*.pth
-*.pth.lock
+# weights and outputs
 *.onnx
+*.pt
 *.pth
-*.mp4
-
-# Rerun recordings
 *.rrd
-
-# Annotation outputs
-data/
-annotations/
-images/
-checkpoints/
-
-# Model weights — too large for git, use Git LFS or release artifacts
-models/*.onnx
-models/*.pt
-models/*.pth
-models/mhr_assets/
-commands.md
-!models/README.md
-
-# Transfer archives (dataset tarballs)
+*.mp4
 *.tar
 *.tar.gz
-
-# Training run outputs (checkpoints / ONNX exports / logs)
+models/
 runs/
+checkpoints/
 
-# Notebook checkpoints
-.ipynb_checkpoints/
-/competitors/
-*.png
-
-# Saved teacher runs for `demo.py --show-reference` (renders + packed .npz).
-# Local and regenerable: tools/pack_reference.py rebuilds the .npz from a
-# video_to_pose_pipeline --save_meshes run. 247 MB here.
-reference/
+# training data
+data/
+data_*/
+annotations/
+images/

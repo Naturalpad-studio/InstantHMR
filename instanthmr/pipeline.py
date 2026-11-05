@@ -1,260 +1,49 @@
-"""End-to-end pose estimation pipeline.
-
-Combines the RF-DETR person detector with InstantHMR to produce per-person
-3D + 2D joints from a single RGB frame, while reporting **separate**
-detector and HMR timings so the demo can surface them.
-"""
-
+"""Person detection followed by InstantHMR, with per-stage timings."""
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
-from .detector import RFDETRDetector
-from .inference import InstantHMR, HMRPrediction
-from .smoothing import _Tracker
+from .detector import PersonDetector
+from .inference import HMRPrediction, InstantHMR
+from .models import DEFAULT_MODEL, resolve_model
 
 
 @dataclass
 class FrameResult:
-    """Output of one ``PosePipeline.predict`` call.
-
-    Attributes:
-        persons: Per-person ``HMRPrediction``s (possibly empty).
-        detector_ms: Wall-clock time for the detector forward pass (0 on
-            frames where the detector was skipped via ``detector_stride``).
-        hmr_ms: Wall-clock time for InstantHMR across all persons in the
-            frame (sum, not average — or one batched call when
-            ``batch_persons=True``).
-        total_ms: ``detector_ms + hmr_ms`` plus pipeline overhead.
-    """
-
     persons: list[HMRPrediction]
     detector_ms: float
     hmr_ms: float
-    total_ms: float
-
-
-def _expand_bbox(bbox: np.ndarray, w: int, h: int, expand: float) -> np.ndarray:
-    bw = bbox[2] - bbox[0]
-    bh = bbox[3] - bbox[1]
-    return np.array([
-        max(0.0, bbox[0] - bw * expand),
-        max(0.0, bbox[1] - bh * expand),
-        min(float(w), bbox[2] + bw * expand),
-        min(float(h), bbox[3] + bh * expand),
-    ], dtype=np.float32)
-
-
-@dataclass
-class _Box:
-    """What :class:`instanthmr.smoothing._Tracker` reads off a person."""
-    bbox: np.ndarray
 
 
 class PosePipeline:
-    """Full RF-DETR → InstantHMR pipeline.
+    """RF-DETR, then InstantHMR on every detected person in one batched call.
 
-    Args:
-        onnx_path: Path to ``instanthmr.onnx``.
-        device: ``"cuda"``, ``"coreml"`` or ``"cpu"`` for InstantHMR.
-        detector_variant: ``"nano" | "small" | "medium" | "base" | "large"``.
-        det_confidence: RF-DETR confidence threshold.
-        max_persons: Maximum number of persons returned per frame.
-        detector_stride: Run the detector every ``N`` frames; on the
-            in-between frames, reuse the previous frame's detections
-            (slightly expanded) to drive InstantHMR. ``1`` reproduces the
-            original "detect every frame" behaviour. The detector is by
-            far the dominant cost on most hardware, so stride 2–3 is the
-            single biggest knob for end-to-end FPS.
-        batch_persons: When ``True`` (default), all detected persons in a
-            frame are batched into a single InstantHMR ONNX call instead
-            of looping. This is a meaningful win for multi-person frames
-            and free for single-person frames.
-        mhr: Optional MHR backend (see :mod:`instanthmr.mhr_renderer`).
-            Required for MHR-only graphs, whose 3D keypoints are derived
-            from the predicted MHR parameters instead of a 3D head; ignored
-            by graphs that carry a ``joints_3d`` output.
-        focal: The camera's focal length in pixels, when known. A graph
-            exported from a ``--cliff-focal`` checkpoint is conditioned on
-            angles rather than pixels, so it needs a focal; without one it
-            falls back to a diagonal-derived stand-in, which mis-places the
-            person in depth on any camera whose true focal differs.
-        cliff_focal: Override the conditioning form; normally read from the
-            ONNX metadata. See :class:`instanthmr.inference.InstantHMR`.
-        use_prev: For a prev-token graph, feed each tracked person their own
-            prediction from ``prev_lag`` frames earlier (IoU tracking on the
-            detector boxes); the previous pose is withheld on a track's first
-            ``prev_lag`` frames. ``False`` always withholds it. Ignored by
-            other graphs.
-        prev_lag: Processed frames between a prediction and the frame it
-            feeds. 5 (167 ms at 30 fps) is what the benchmarks use, inside
-            the 5-20 frame pairs the token was trained on.
-
-    Example
-    -------
-        pipeline = PosePipeline("models/instanthmr.onnx", detector_stride=2)
-        result = pipeline.predict(image_rgb)
-        for p in result.persons:
-            print(p.joints_3d_cam.shape)   # (70, 3)
+    `model` is a released model name (nano, tiny, small, medium, medium-commercial) or an .onnx
+    path. `detector_stride` > 1 runs the detector every N frames and reuses its boxes in between.
     """
 
-    def __init__(
-        self,
-        onnx_path: str | Path,
-        device: str = "cuda",
-        detector_variant: str = "medium",
-        det_confidence: float = 0.5,
-        max_persons: int = 2,
-        detector_stride: int = 1,
-        batch_persons: bool = True,
-        mhr: object | None = None,
-        focal: float | None = None,
-        cliff_focal: bool | None = None,
-        use_prev: bool = True,
-        prev_lag: int = 5,
-    ):
-        if detector_stride < 1:
-            raise ValueError("detector_stride must be >= 1")
+    def __init__(self, model: str | Path = DEFAULT_MODEL, device: str = "cuda", detector: str = "medium",
+                 det_confidence: float = 0.5, max_persons: int = 4, detector_stride: int = 1,
+                 focal: float | None = None):
+        self.hmr = InstantHMR(resolve_model(model), device=device, focal=focal, max_batch=max_persons)
+        self.detector = PersonDetector(detector, det_confidence, max_persons)
+        self.detector_stride = max(1, detector_stride)
+        self._frame = 0
+        self._boxes = np.zeros((0, 4), np.float32)
+        self._scores = np.zeros(0, np.float32)
+        self.detector(np.zeros((288, 288, 3), np.uint8))
+        self.hmr.warmup(max_persons)
 
-        self.hmr = InstantHMR(onnx_path, device=device, mhr=mhr,
-                              focal=focal, cliff_focal=cliff_focal)
-        if self.hmr.derives_joints_3d and mhr is None:
-            raise ValueError(
-                f"{Path(onnx_path).name} has no 'joints_3d' output (MHR-only student): "
-                "its 3D keypoints come from an MHR forward pass, so an MHR backend is "
-                "required. Pass mhr=build_mhr(...), or run demo.py with --mhr-model / "
-                "--mhr-assets."
-            )
-        self.detector = RFDETRDetector(
-            variant=detector_variant,
-            confidence=det_confidence,
-            max_persons=max_persons,
-        )
-
-        # Warm up both models before the first real frame.
-        # - RF-DETR (PyTorch): first call triggers CUDA JIT for transformer ops.
-        # - InstantHMR (ONNX/CUDA EP): first call at a new batch size triggers
-        #   kernel compilation and GPU memory allocation.
-        # With padded-batch inference the session only ever sees two shapes:
-        # batch=1 and batch=max_persons — two warm-up calls covers everything.
-        print(f"Warming up models (max_persons={max_persons})…", flush=True)
-        self.detector.warmup()
-        self.hmr.warmup(max_batch_size=max_persons)
-        if mhr is not None:
-            self._warmup_mhr(mhr, max_persons)
-        print("Ready.", flush=True)
-
-        self._max_persons = max_persons
-        self._detector_stride = detector_stride
-        self._batch_persons = batch_persons
-        self._frame_idx = 0
-        self._last_detections: list[dict] = []
-        self._last_bbox: Optional[np.ndarray] = None
-        self.feeds_prev = use_prev and self.hmr.has_prev_input
-        self._prev_lag = max(1, prev_lag)
-        self._tracker = _Tracker()
-        self._history: dict[int, deque] = {}   # track id -> last prev_lag prev_pose()s
-
-    @staticmethod
-    def _warmup_mhr(mhr, max_persons: int) -> None:
-        """Run the MHR rig once per batch shape the demo will actually use.
-
-        TorchScript specialises on input shapes over the first few calls, so an
-        un-warmed rig costs hundreds of ms on frame 1 instead of ~1 ms. Three
-        passes is what it takes for the profiling executor to settle: the first
-        records shapes, the second triggers the fusion compile, the third runs
-        the compiled kernels.
-        """
-        pose = np.zeros((max_persons, 204), dtype=np.float32)
-        shape = np.zeros((max_persons, 45), dtype=np.float32)
-        for _ in range(3):
-            mhr.forward(pose[0], shape[0])          # mesh: always single-person
-            if getattr(mhr, "has_keypoints", False):
-                for n in sorted({1, max_persons}):  # keypoints: 1 and the padded batch
-                    mhr.keypoints(pose[:n], shape[:n])
-
-    def predict(self, image_rgb: np.ndarray) -> FrameResult:
-        """Detect all persons in *image_rgb* and run InstantHMR on each."""
-        t_total_start = time.perf_counter()
-        h, w = image_rgb.shape[:2]
-
-        # ---- Detector (with optional stride) ----
-        run_detector = (self._frame_idx % self._detector_stride) == 0
-        if run_detector:
-            t0 = time.perf_counter()
-            detections = self.detector.detect(image_rgb)
-            detector_ms = (time.perf_counter() - t0) * 1000.0
-            if detections:
-                self._last_detections = detections
-        else:
-            detections = []
-            detector_ms = 0.0
-
-        # If the detector skipped or missed this frame, reuse the previous
-        # detections (slightly expanded to absorb small motion). This is a
-        # cheap form of tracking that keeps HMR fed with a plausible bbox.
-        if not detections and self._last_detections:
-            detections = [
-                {
-                    "bbox": _expand_bbox(d["bbox"], w, h, expand=0.1),
-                    "confidence": float(d["confidence"]) * 0.9,
-                }
-                for d in self._last_detections
-            ]
-        elif not detections and self._last_bbox is not None:
-            # Backwards-compatible single-bbox fallback (used when no prior
-            # multi-person detections exist).
-            fb = _expand_bbox(self._last_bbox, w, h, expand=0.1)
-            detections = [{"bbox": fb, "confidence": 0.0}]
-
-        # ---- InstantHMR ----
-        # Hard-cap so we never exceed the pre-warmed batch size.
-        detections = detections[: self._max_persons]
-        outputs: list[HMRPrediction] = []
+    def __call__(self, image_rgb: np.ndarray) -> FrameResult:
+        t0 = time.perf_counter()
+        if self._frame % self.detector_stride == 0:
+            self._boxes, self._scores = self.detector(image_rgb)
         t1 = time.perf_counter()
-        ids, prev = [], [None] * len(detections)
-        if self.feeds_prev:
-            ids = self._tracker.assign([_Box(d["bbox"]) for d in detections])
-            prev = [h[0] if len(h) == self._prev_lag else None
-                    for h in (self._history.get(t, ()) for t in ids)]
-        if detections:
-            if self._batch_persons and len(detections) > 1:
-                # Always pad to _max_persons so ONNX sees a constant batch
-                # shape and never triggers a mid-demo recompilation.
-                outputs = self.hmr.predict_batch(
-                    image_rgb, detections, padded_to=self._max_persons, prev=prev,
-                )
-            else:
-                for det, pp in zip(detections, prev):
-                    outputs.append(self.hmr.predict(
-                        image_rgb,
-                        bbox=det["bbox"],
-                        confidence=det["confidence"],
-                        prev=pp,
-                    ))
-        if self.feeds_prev:
-            for t, o in zip(ids, outputs):
-                self._history.setdefault(t, deque(maxlen=self._prev_lag)).append(o.prev_pose())
-            for t in set(self._history) - self._tracker.active_ids:
-                del self._history[t]
-        hmr_ms = (time.perf_counter() - t1) * 1000.0
-
-        if outputs:
-            best = max(outputs, key=lambda o: o.confidence)
-            self._last_bbox = best.bbox.copy()
-
-        total_ms = (time.perf_counter() - t_total_start) * 1000.0
-        self._frame_idx += 1
-
-        return FrameResult(
-            persons=outputs,
-            detector_ms=detector_ms,
-            hmr_ms=hmr_ms,
-            total_ms=total_ms,
-        )
+        persons = self.hmr.predict(image_rgb, self._boxes, self._scores)
+        t2 = time.perf_counter()
+        self._frame += 1
+        return FrameResult(persons, (t1 - t0) * 1000, (t2 - t1) * 1000)

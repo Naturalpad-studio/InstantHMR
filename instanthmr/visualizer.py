@@ -1,476 +1,103 @@
-"""Rerun-based 3D visualization for the InstantHMR demo.
-
-Logs, per frame:
-  - ``camera/image``        : annotated RGB frame (2D skeleton + bbox + a
-                              text panel showing detector / HMR / render / total ms).
-  - ``camera``              : pinhole intrinsics so the image becomes a
-                              proper frustum in the 3D scene.
-  - ``world/persons/...``   : the 70 3D keypoints + skeleton lines per person.
-                              For an MHR-only student these come from the MHR
-                              forward pass itself (see ``instanthmr.inference``).
-  - ``world/persons/.../mesh``: full MHR body mesh when an MHR backend is
-                              provided (vertices from a true MHR forward pass).
-                              Rendered semi-transparent via ``albedo_factor``
-                              so the keypoints inside the body stay visible.
-  - ``timing/detector_ms``  : scalar plot of RF-DETR latency.
-  - ``timing/hmr_ms``       : scalar plot of InstantHMR latency.
-  - ``timing/render_ms``    : scalar plot of MHR mesh rendering latency.
-  - ``timing/total_ms``     : scalar plot of full pipeline latency.
-  - ``timing/fps``          : scalar plot of effective frames-per-second.
-  - ``contact/person_N/{left,right}``: per-foot contact probability, and the
-                              feet drawn red while planted (> contact_threshold), for a
-                              prev-token graph that has a contact head.
-
-``rr.init(..., spawn=True)`` is called automatically so the viewer opens
-on construction (pass ``spawn_viewer=False`` to suppress).
-"""
-
+"""Rerun viewer: the frame with 2D skeletons and timings, the 3D scene, and a latency plot."""
 from __future__ import annotations
 
-import time
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import Optional, Sequence
 
 import cv2
 import numpy as np
 
 from .inference import HMRPrediction
-from .skeleton import edges_for
+from .skeleton import SKELETON_EDGES
 
-if TYPE_CHECKING:
-    from .mhr_renderer import MHRRenderer
-
-#: Base skin tone of the body mesh, before the transparency factor is applied.
 MESH_COLOR = (200, 160, 130)
-#: Default mesh opacity. Low enough that the 70 keypoints read through the
-#: body, high enough that the silhouette is still legible.
-MESH_ALPHA = 0.35
-
-#: Reference (teacher) overlay colours — a cool palette against the student's
-#: warm skin tone and green/yellow skeleton, so the two read apart at a glance
-#: even where the bodies overlap.
-REF_MESH_COLOR = (110, 170, 255)
-REF_JOINT_COLOR = (0, 200, 255)
-REF_SKELETON_COLOR = (255, 110, 255)
-
-#: MHR70 keypoints of each foot (ankle, big toe, small toe, heel), in the
-#: [left, right] order of ``HMRPrediction.contact_prob``.
-FOOT_KP = ((13, 15, 16, 17), (14, 18, 19, 20))
-FOOT_NAMES = ("left", "right")
-PLANTED_COLOR = (255, 40, 40)
-FREE_COLOR = (230, 230, 230)
+JOINT_COLOR = (0, 230, 0)
+BONE_COLOR = (255, 230, 0)
+BOX_COLOR = (0, 200, 255)
 
 
 class RerunVisualizer:
-    """Rerun logger for the demo.
-
-    Args:
-        application_id: Rerun application id.
-        spawn_viewer: open the viewer GUI on construction.
-        save_path: optional ``.rrd`` recording path.
-        mhr_renderer: MHR backend used to skin the body mesh. Any object with
-            ``.forward(mhr_params, shape_params)`` and ``.faces`` works; see
-            :mod:`instanthmr.mhr_renderer`.
-        mesh_alpha: body-mesh opacity in ``[0, 1]``. Applied through Rerun's
-            ``albedo_factor`` rather than per-vertex alpha, so one scalar
-            controls the whole surface.
-        reference: optional :class:`instanthmr.reference.ReferenceTrack` whose
-            saved teacher prediction is logged alongside the student's under
-            ``world/reference/``, in the cool palette above. It is decoded by
-            the SAME ``mhr_renderer``, so a visible difference is the model and
-            not the renderer.
-    """
-
-    def __init__(
-        self,
-        application_id: str = "instanthmr_demo",
-        spawn_viewer: bool = True,
-        save_path: str | None = None,
-        mhr_renderer: "MHRRenderer | None" = None,
-        mesh_alpha: float = MESH_ALPHA,
-        reference=None,
-        contact_threshold: float = 0.5,
-    ):
+    def __init__(self, faces: Optional[np.ndarray] = None, mesh_alpha: float = 0.35, spawn: bool = True,
+                 save_path: Optional[str] = None):
         import rerun as rr
 
-        self._rr = rr
-        self._mhr_renderer = mhr_renderer
-        self._mesh_albedo = (
-            *MESH_COLOR,
-            int(round(255 * min(max(mesh_alpha, 0.0), 1.0))),
-        )
-        self._reference = reference
-        self._ref_albedo = (
-            *REF_MESH_COLOR,
-            int(round(255 * min(max(mesh_alpha, 0.0), 1.0))),
-        )
-        self._prev_num_ref = 0
-        self.contact_threshold = contact_threshold
-        rr.init(application_id, spawn=spawn_viewer)
-
-        # SAM3D / MHR convention: right-handed, Y-down camera frame.
-        rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
-
+        self.rr = rr
+        self.faces = faces
+        self.albedo = (*MESH_COLOR, int(round(255 * min(max(mesh_alpha, 0.0), 1.0))))
+        rr.init("instanthmr", spawn=spawn)
         if save_path:
             rr.save(save_path)
+        rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
+        self._n_logged = 0
+        self._layout_sent = False
 
-        self._prev_num_persons = 0
-        self._blueprint_sent = False
+    def log(self, frame: int, image_rgb: np.ndarray, persons: Sequence[HMRPrediction],
+            timings: dict[str, float]) -> None:
+        rr = self.rr
+        rr.set_time("frame", sequence=frame)
+        for name, ms in timings.items():
+            rr.log(f"timing/{name}", rr.Scalars(float(ms)))
+        for stale in range(len(persons), self._n_logged):
+            rr.log(f"world/person_{stale}", rr.Clear(recursive=True))
+        self._n_logged = len(persons)
 
-    # ------------------------------------------------------------------
-    # Per-frame logging
-    # ------------------------------------------------------------------
-
-    def log_frame(
-        self,
-        image_rgb: np.ndarray,
-        persons: Sequence[HMRPrediction],
-        frame_idx: int,
-        timestamp: float | None = None,
-        detector_ms: Optional[float] = None,
-        hmr_ms: Optional[float] = None,
-        total_ms: Optional[float] = None,
-    ) -> float:
-        """Log one frame of the pipeline to Rerun.
-
-        Args:
-            image_rgb: full-frame RGB image, ``(H, W, 3)`` uint8.
-            persons: per-person HMR predictions for this frame.
-            frame_idx: monotonic frame counter (sets the Rerun timeline).
-            timestamp: optional wall-clock timestamp (seconds).
-            detector_ms: RF-DETR latency for this frame (ms).
-            hmr_ms: InstantHMR latency for this frame, summed across
-                persons (ms).
-            total_ms: full pipeline latency for this frame (ms).
-
-        Returns:
-            render_ms: time spent running MHR forward passes + Rerun mesh
-                logging for this frame (0.0 when no MHRRenderer is set).
-        """
-        rr = self._rr
-        rr.set_time("frame", sequence=frame_idx)
-        if timestamp is not None:
-            rr.set_time("timestamp", duration=timestamp)
-
-        # Per-stage scalar plots
-        if detector_ms is not None:
-            rr.log("timing/detector_ms", rr.Scalars(float(detector_ms)))
-        if hmr_ms is not None:
-            rr.log("timing/hmr_ms", rr.Scalars(float(hmr_ms)))
-        if total_ms is not None:
-            rr.log("timing/total_ms", rr.Scalars(float(total_ms)))
-            if total_ms > 0:
-                rr.log("timing/fps", rr.Scalars(1000.0 / float(total_ms)))
-
-        # Clear stale person entities from previous frames
-        n = len(persons)
-        for stale in range(n, self._prev_num_persons):
-            rr.log(f"world/persons/person_{stale}", rr.Clear(recursive=True))
-        self._prev_num_persons = n
+        for i, p in enumerate(persons):
+            joints = p.joints_3d_cam
+            rr.log(f"world/person_{i}/joints", rr.Points3D(joints, radii=0.012, colors=JOINT_COLOR))
+            rr.log(f"world/person_{i}/skeleton",
+                   rr.LineStrips3D(joints[np.array(SKELETON_EDGES)], colors=BONE_COLOR, radii=0.004))
+            if self.faces is not None and p.vertices_local is not None:
+                rr.log(f"world/person_{i}/mesh", rr.Mesh3D(vertex_positions=p.vertices_cam,
+                                                           triangle_indices=self.faces, albedo_factor=self.albedo))
 
         h, w = image_rgb.shape[:2]
+        rr.log("camera/image", rr.Image(draw_overlay(image_rgb, persons, timings)))
+        if persons:
+            depth = float(np.median([p.cam_trans[2] for p in persons]))
+            rr.log("camera", rr.Pinhole(width=w, height=h, focal_length=persons[0].focal_length,
+                                        principal_point=[w / 2, h / 2], image_plane_distance=max(0.25 * depth, 0.2)))
+            if not self._layout_sent:
+                self._send_layout(persons[0])
+                self._layout_sent = True
 
-        # Before the no-detection early-out below: the reference is independent
-        # of whether the student found anybody, and seeing it alone on a frame
-        # the student missed is exactly the failure worth looking at.
-        if self._reference is not None:
-            self._log_reference(frame_idx)
-
-        # Always log the image — even when no person was detected — so the
-        # viewer keeps showing the camera feed and the timing HUD.
-        render_ms = 0.0
-        if not persons:
-            blank = self._draw_overlay(image_rgb, [], detector_ms, hmr_ms, render_ms, total_ms)
-            rr.log("camera/image", rr.Image(blank))
-            rr.log("timing/render_ms", rr.Scalars(0.0))
-            return render_ms
-
-        # --- MHR mesh rendering (timed) ----------------------------------
-        if self._mhr_renderer is not None:
-            t0 = time.perf_counter()
-            for idx, person in enumerate(persons):
-                self._log_person_mesh(idx, person)
-            render_ms = (time.perf_counter() - t0) * 1000.0
-
-        rr.log("timing/render_ms", rr.Scalars(render_ms))
-
-        for idx, person in enumerate(persons):
-            self._log_person(idx, person)
-
-        annotated = self._draw_overlay(
-            image_rgb, persons, detector_ms, hmr_ms, render_ms, total_ms,
-            self.contact_threshold,
-        )
-        rr.log("camera/image", rr.Image(annotated))
-
-        # Pinhole camera in the 3D scene — full-frame focal so the image
-        # plane sits in front of the joints, not on top of them.
-        first = persons[0]
-        fx, fy = float(first.focal_length[0]), float(first.focal_length[1])
-        cx, cy = w / 2.0, h / 2.0
-        depth = float(first.joints_3d_cam[:, 2].mean())
-        plane_dist = max(depth * 0.25, 0.2)
-
-        rr.log(
-            "camera",
-            rr.Pinhole(
-                width=w,
-                height=h,
-                focal_length=[fx, fy],
-                principal_point=[cx, cy],
-                image_plane_distance=plane_dist,
-            ),
-        )
-
-        if not self._blueprint_sent:
-            self._send_blueprint(first)
-            self._blueprint_sent = True
-
-        return render_ms
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _log_person(self, idx: int, person: HMRPrediction) -> None:
-        """Log the 70 3D keypoints and the skeleton wiring for one person.
-
-        For an MHR-only student ``joints_3d_cam`` was regressed from the MHR
-        skeleton that also produced the mesh, so the points sit exactly inside
-        the surface logged by :meth:`_log_person_mesh`.
-        """
-        rr = self._rr
-        path = f"world/persons/person_{idx}"
-
-        joints = person.joints_3d_cam
-        rr.log(
-            f"{path}/joints",
-            rr.Points3D(positions=joints, radii=0.012, colors=[0, 230, 0]),
-        )
-
-        edges = edges_for(joints.shape[0])
-        if edges:
-            lines = [
-                [joints[i].tolist(), joints[j].tolist()]
-                for i, j in edges
-            ]
-            rr.log(
-                f"{path}/skeleton",
-                rr.LineStrips3D(lines, colors=[255, 230, 0], radii=0.004),
-            )
-
-        if person.contact_prob is not None:
-            for name, kp, prob in zip(FOOT_NAMES, FOOT_KP, person.contact_prob):
-                planted = prob > self.contact_threshold
-                rr.log(f"{path}/feet/{name}", rr.Points3D(
-                    positions=joints[list(kp)], radii=0.03 if planted else 0.015,
-                    colors=[PLANTED_COLOR if planted else FREE_COLOR]))
-                rr.log(f"contact/person_{idx}/{name}", rr.Scalars(float(prob)))
-
-    def _log_reference(self, frame_idx: int) -> None:
-        """Log the saved teacher prediction for this frame under ``world/reference``.
-
-        Kept in a sibling entity tree rather than mixed into
-        ``world/persons/`` so the viewer can toggle either side on its own.
-        """
-        rr = self._rr
-        persons = self._reference.persons_at(frame_idx)
-
-        for stale in range(len(persons), self._prev_num_ref):
-            rr.log(f"world/reference/person_{stale}", rr.Clear(recursive=True))
-        self._prev_num_ref = len(persons)
-
-        for idx, ref in enumerate(persons):
-            path = f"world/reference/person_{idx}"
-            joints = ref.joints_3d_cam
-            rr.log(
-                f"{path}/joints",
-                rr.Points3D(positions=joints, radii=0.012,
-                            colors=list(REF_JOINT_COLOR)),
-            )
-            edges = edges_for(joints.shape[0])
-            if edges:
-                rr.log(
-                    f"{path}/skeleton",
-                    rr.LineStrips3D(
-                        [[joints[i].tolist(), joints[j].tolist()] for i, j in edges],
-                        colors=list(REF_SKELETON_COLOR), radii=0.004,
-                    ),
-                )
-            # The teacher stored parameters, not vertices; decoding them with
-            # the student's own rig is what keeps the two meshes comparable.
-            if self._mhr_renderer is not None:
-                verts = self._mhr_renderer.forward(
-                    ref.mhr_params, ref.shape_params,
-                ) + ref.cam_trans
-                rr.log(
-                    f"{path}/mesh",
-                    rr.Mesh3D(
-                        vertex_positions=verts,
-                        triangle_indices=self._mhr_renderer.faces,
-                        albedo_factor=self._ref_albedo,
-                    ),
-                )
-
-    def _log_person_mesh(self, idx: int, person: HMRPrediction) -> None:
-        """Run MHR forward pass and log the resulting mesh vertices via Rerun."""
-        assert self._mhr_renderer is not None
-
-        # Decode mhr_params + shape_params → body-space vertices.
-        verts_local = self._mhr_renderer.forward(
-            person.mhr_params, person.shape_params,
-        )  # (V, 3), body-centred
-
-        # Shift from body space to camera space using InstantHMR's cam_trans.
-        verts_cam = verts_local + person.cam_trans  # (V, 3) broadcast
-
-        faces = self._mhr_renderer.faces  # (F, 3) int32, shared across frames
-
-        # Tint + transparency come from `albedo_factor`, a single RGBA multiplier
-        # for the whole surface. Per-vertex colours would work too, but the
-        # viewer multiplies the two, so keeping the alpha in one place makes the
-        # `mesh_alpha` knob mean exactly what it says.
-        self._rr.log(
-            f"world/persons/person_{idx}/mesh",
-            self._rr.Mesh3D(
-                vertex_positions=verts_cam,
-                triangle_indices=faces,
-                albedo_factor=self._mesh_albedo,
-            ),
-        )
-
-    @staticmethod
-    def _draw_overlay(
-        image_rgb: np.ndarray,
-        persons: Sequence[HMRPrediction],
-        detector_ms: Optional[float],
-        hmr_ms: Optional[float],
-        render_ms: float,
-        total_ms: Optional[float],
-        contact_threshold: float = 0.5,
-    ) -> np.ndarray:
-        """Draw per-person bbox + 2D skeleton + a timing HUD onto the frame."""
-        out = image_rgb.copy()
-        h, w = out.shape[:2]
-
-        for person in persons:
-            x1, y1, x2, y2 = person.bbox.astype(int)
-            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 200, 255), 2)
-            label = f"{person.confidence:.2f}"
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), (0, 200, 255), -1)
-            cv2.putText(
-                out, label, (x1 + 2, y1 - 4),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
-            )
-
-            j2d = person.joints_2d
-            valid = (
-                (j2d[:, 0] >= 0) & (j2d[:, 0] < w)
-                & (j2d[:, 1] >= 0) & (j2d[:, 1] < h)
-            )
-
-            for i, j in edges_for(j2d.shape[0]):
-                if valid[i] and valid[j]:
-                    pt1 = tuple(j2d[i].astype(int))
-                    pt2 = tuple(j2d[j].astype(int))
-                    cv2.line(out, pt1, pt2, (255, 230, 0), 2)
-
-            for k, (x, y) in enumerate(j2d):
-                if valid[k]:
-                    cv2.circle(out, (int(x), int(y)), 3, (0, 230, 0), -1)
-
-            if person.contact_prob is not None:
-                r = max(4, int(round(0.012 * max(h, w))))
-                for name, kp, prob in zip(FOOT_NAMES, FOOT_KP, person.contact_prob):
-                    planted = prob > contact_threshold
-                    for k in kp:
-                        if valid[k]:
-                            cv2.circle(out, tuple(j2d[k].astype(int)), r,
-                                       PLANTED_COLOR if planted else FREE_COLOR,
-                                       -1 if planted else 2)
-                    k = kp[0]
-                    if valid[k]:
-                        cv2.putText(out, f"{name[0].upper()} {prob:.2f}",
-                                    (int(j2d[k, 0]) + r + 2, int(j2d[k, 1]) - r),
-                                    cv2.FONT_HERSHEY_SIMPLEX, max(0.5, r / 12),
-                                    PLANTED_COLOR if planted else FREE_COLOR, 2, cv2.LINE_AA)
-
-        # ---- Timing HUD (top-left, semi-transparent black panel) ----
-        lines: list[str] = []
-        if detector_ms is not None:
-            lines.append(f"RF-DETR   : {detector_ms:6.1f} ms")
-        if hmr_ms is not None:
-            lines.append(f"InstantHMR: {hmr_ms:6.1f} ms")
-        if render_ms > 0.0:
-            lines.append(f"MHR mesh  : {render_ms:6.1f} ms")
-        if total_ms is not None:
-            fps = 1000.0 / total_ms if total_ms > 0 else 0.0
-            lines.append(f"Total     : {total_ms:6.1f} ms ({fps:5.1f} fps)")
-        if lines:
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            scale = max(0.5, min(w, h) / 1500.0)
-            thick = max(1, int(round(scale * 1.5)))
-            sizes = [
-                cv2.getTextSize(s, font, scale, thick)[0] for s in lines
-            ]
-            line_h = max(s[1] for s in sizes) + 8
-            box_w = max(s[0] for s in sizes) + 16
-            box_h = line_h * len(lines) + 8
-
-            overlay = out.copy()
-            cv2.rectangle(overlay, (8, 8), (8 + box_w, 8 + box_h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.55, out, 0.45, 0, out)
-
-            y = 8 + line_h
-            for s in lines:
-                cv2.putText(
-                    out, s, (16, y),
-                    font, scale, (255, 255, 255), thick, cv2.LINE_AA,
-                )
-                y += line_h
-
-        return out
-
-    def _send_blueprint(self, first: HMRPrediction) -> None:
-        """Send the blueprint: camera image | 3D scene | timings (+ contact)."""
+    def _send_layout(self, first: HMRPrediction) -> None:
         import rerun.blueprint as rrb
-        rr = self._rr
 
-        joints = first.joints_3d_cam
-        center = joints.mean(axis=0)
-        extent = float(np.abs(joints - center).max())
-        cam_distance = max(extent * 4.0, 1.5)
-        # Y-down convention: place the orbit camera "in front" along -Z.
-        eye_pos = [
-            float(center[0]),
-            float(center[1]),
-            float(center[2] - cam_distance),
-        ]
+        centre = first.joints_3d_cam.mean(0)
+        distance = max(4 * float(np.abs(first.joints_3d_cam - centre).max()), 1.5)
+        self.rr.send_blueprint(rrb.Blueprint(rrb.Horizontal(
+            rrb.Vertical(rrb.Spatial2DView(origin="camera/image", name="Camera"),
+                         rrb.TimeSeriesView(origin="timing", name="Latency (ms)"), row_shares=[3, 1]),
+            rrb.Spatial3DView(origin="/", name="3D", background=rrb.Background(color=[25, 25, 25]),
+                              eye_controls=rrb.EyeControls3D(
+                                  position=[float(centre[0]), float(centre[1]), float(centre[2] - distance)],
+                                  look_target=centre.tolist(), eye_up=[0.0, -1.0, 0.0], kind=rrb.Eye3DKind.Orbital)),
+            column_shares=[2, 3])))
 
-        plots = [rrb.TimeSeriesView(origin="timing", name="Latency (ms)")]
-        if first.contact_prob is not None:
-            plots.append(rrb.TimeSeriesView(origin="contact",
-                                            name="Foot contact probability"))
-        blueprint = rrb.Blueprint(
-            rrb.Horizontal(
-                rrb.Vertical(
-                    rrb.Spatial2DView(origin="camera/image", name="Camera"),
-                    *plots,
-                    row_shares=[3] + [1] * len(plots),
-                ),
-                rrb.Spatial3DView(
-                    origin="/",
-                    name="3D Scene",
-                    eye_controls=rrb.EyeControls3D(
-                        position=eye_pos,
-                        look_target=[float(center[0]), float(center[1]), float(center[2])],
-                        eye_up=[0.0, -1.0, 0.0],
-                        kind=rrb.Eye3DKind.Orbital,
-                        tracking_entity="world/persons/person_0",
-                    ),
-                    background=rrb.Background(color=[25, 25, 25]),
-                ),
-                column_shares=[2, 3],
-            ),
-        )
-        rr.send_blueprint(blueprint)
+
+def draw_overlay(image_rgb: np.ndarray, persons: Sequence[HMRPrediction], timings: dict[str, float]) -> np.ndarray:
+    """The frame with each person's box and 2D skeleton, and the stage timings top left."""
+    out = image_rgb.copy()
+    h, w = out.shape[:2]
+    thick = max(2, round(min(h, w) / 400))
+    for p in persons:
+        x1, y1, x2, y2 = p.bbox.astype(int)
+        cv2.rectangle(out, (x1, y1), (x2, y2), BOX_COLOR, thick)
+        pts = p.joints_2d.astype(int)
+        for a, b in SKELETON_EDGES:
+            cv2.line(out, tuple(pts[a]), tuple(pts[b]), BONE_COLOR, thick, cv2.LINE_AA)
+        for pt in pts:
+            cv2.circle(out, tuple(pt), thick + 1, JOINT_COLOR, -1, cv2.LINE_AA)
+
+    lines = [f"{name:<9s}{ms:6.1f} ms" for name, ms in timings.items()]
+    total = sum(timings.values())
+    if total > 0:
+        lines.append(f"{'total':<9s}{total:6.1f} ms ({1000 / total:.0f} fps)")
+    scale = max(0.5, min(h, w) / 1200)
+    line_h = int(28 * scale)
+    panel = out.copy()
+    cv2.rectangle(panel, (8, 8), (int(300 * scale) + 16, 16 + line_h * len(lines)), (0, 0, 0), -1)
+    cv2.addWeighted(panel, 0.55, out, 0.45, 0, out)
+    for k, line in enumerate(lines):
+        cv2.putText(out, line, (16, 8 + line_h * (k + 1)), cv2.FONT_HERSHEY_SIMPLEX, scale * 0.7,
+                    (255, 255, 255), max(1, round(scale * 1.5)), cv2.LINE_AA)
+    return out

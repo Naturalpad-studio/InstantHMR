@@ -1,32 +1,7 @@
-# Recommended install path is `python install.py`, which picks the right
-# torch + onnxruntime wheels for your hardware (Linux + CUDA, Mac, or CPU).
-# This file is a portable fallback that uses the CPU wheel of torch and the
-# stock CPU build of onnxruntime — it works everywhere but leaves a lot of
-# performance on the table on NVIDIA GPUs and Apple Silicon.
-
-# ----- inference + viz (required by demo.py) -----
-numpy>=1.24
-opencv-python>=4.8
-pillow>=10
-rfdetr>=1.0
-rerun-sdk>=0.21
-
-# Pulled in transitively by rfdetr; on Linux + CUDA you almost certainly
-# want a CUDA wheel from the pytorch index instead — see install.py.
-torch>=2.2
-torchvision
-
-# Mac ships CoreML EP inside plain onnxruntime; Linux GPU wants
-# onnxruntime-gpu (which install.py picks). The CPU wheel below is the
-# safe fallback.
-onnxruntime>=1.19
-
-# ----- MHR body mesh rendering -----
-# Optional.  Requires Python >= 3.12 and a separate setup step.
-# See requirements-mhr.txt and the "MHR body mesh" section of README.md.
-
-# ----- training / annotation (optional, for reproduction) -----
-# timm>=1.0
-# tqdm
-# loguru
-# (For annotation: install Meta's sam-3d-body separately — see docs/annotation.md)
+numpy
+opencv-python
+huggingface_hub
+rerun-sdk==0.31.*
+rfdetr>=1.6
+onnxruntime-gpu[cuda,cudnn]==1.26.* ; platform_system != "Darwin"
+onnxruntime==1.26.* ; platform_system == "Darwin"

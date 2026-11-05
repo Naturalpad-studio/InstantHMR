@@ -4,18 +4,13 @@ Convert the official ``facebook/sam-3d-body-dataset`` parquet annotations into t
 per-crop ``images/*.png`` + ``annotations/*.npz`` layout consumed by
 ``training/train.py``.
 
-This lets you train InstantHMR directly on the original SAM 3D Body ground-truth
-MHR fits, instead of (or alongside) the teacher-distilled pseudo-labels produced
-by ``tools/annotate_dataset.py``. The output ``.npz`` schema is exactly the one
-that script writes, so the training notebook needs **no changes**.
-
-Key facts established by auditing the parquet (see tools/README or docs):
+These are the ground-truth MHR fits SAM 3D Body was built from. Facts about the parquet:
   * The parquet has no ``cam_trans`` column, but the SAM3D translation is fully
     recoverable. The global translation is the first three MHR ``model_params``:
 
         cam_trans = [ model_params[0], -model_params[1], -model_params[2] ] / 10
 
-    and the body-centred joints (distillation convention, vision Y-down) are
+    and the body-centred joints (vision frame, Y down) are
 
         joints_3d = keypoints_3d[:, :3] * [1, -1, -1]   # negate Y and Z
 
@@ -27,7 +22,7 @@ Key facts established by auditing the parquet (see tools/README or docs):
   * Persons with ``mhr_valid == False`` have unreliable fits and are skipped by
     default (the 2D in-the-wild splits — coco/mpii/aic — rely on this flag).
 
-NPZ payload (per crop) — identical to tools/annotate_dataset.py:
+NPZ payload (per crop):
     orig_shape          (2,)     [H, W] of the full uncropped image
     bbox                (4,)     [x1, y1, x2, y2] in original image coords (xyxy)
     bbox_square         (4,)     [x1, y1, x2, y2] expanded square crop (1.2x)
@@ -84,17 +79,12 @@ from tqdm import tqdm
 
 CROP_SIZE = 224
 # Negate Y and Z to map MHR-native (Y-up) coordinates into the vision camera
-# frame (Y-down, Z-forward) used everywhere in the distillation pipeline.
+# frame (Y-down, Z-forward) the trainer uses.
 NEG_YZ = np.array([1.0, -1.0, -1.0], dtype=np.float64)
 # MHR root translation (model_params[:3]) is stored in decimetres.
 TRANS_SCALE = 10.0
 
 
-# ---------------------------------------------------------------------------
-# Crop geometry — kept byte-for-byte in sync with
-# tools/annotate_dataset.py:get_square_crop_padded so the 224 crops produced
-# here are pixel-identical to the distillation crops.
-# ---------------------------------------------------------------------------
 def get_square_crop_padded(image: np.ndarray, bbox: np.ndarray, expand: float = 1.2):
     """Square crop around *bbox*, black-padded where it leaves the image."""
     h, w = image.shape[:2]
@@ -169,8 +159,8 @@ def reproj_error(joints_3d: np.ndarray, cam_trans: np.ndarray,
                  orig_shape: np.ndarray) -> float:
     """RMS px error of (joints_3d + cam_trans) projected onto joints_2d.
 
-    Uses the exact camera model the notebook loss assumes: focal from cam_int,
-    principal point at the image centre.
+    Camera model of the training losses: focal from cam_int, principal point at
+    the image centre.
     """
     h, w = float(orig_shape[0]), float(orig_shape[1])
     cam = joints_3d + cam_trans[None, :]
@@ -197,13 +187,9 @@ def build_annotation(row, img_h: int, img_w: int) -> dict:
     cam_trans = cam_trans_from_params(model_params)  # from model_params[:3] BEFORE zeroing
     focal = np.array([cam_int[0, 0], cam_int[1, 1]], dtype=np.float32)
 
-    # The dataset bakes the global translation into model_params[:3], so the MHR
-    # rig decodes an already-camera-positioned mesh. The distillation pipeline
-    # (notebook Cells 2 & 8) instead expects a *body-centred* mesh and adds
-    # cam_trans separately. Zero the translation here so the MHR mesh comes out
-    # body-centred — verified to match `joints_3d` to ~1e-7. Without this, the
-    # notebook double-counts cam_trans (loss_structural / loss_feet /
-    # loss_reproj_mhr and the MHR-param visualiser all go wrong).
+    # The dataset bakes the global translation into model_params[:3]; the trainer
+    # expects a body-centred mesh and carries the translation in cam_trans, so it
+    # is zeroed here (the mesh then matches `joints_3d` to ~1e-7).
     model_params = model_params.copy()
     model_params[:3] = 0.0
 
@@ -235,7 +221,7 @@ def save_person(full_img_rgb, ann, name, images_dir, annotations_dir):
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Convert sam-3d-body-dataset parquet -> distillation .npz crops.",
+        description="Convert sam-3d-body-dataset parquet -> per-person .npz crops.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
