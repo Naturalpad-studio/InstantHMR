@@ -14,7 +14,8 @@ and 3D, and a full body mesh in the [Momentum Human Rig](https://github.com/face
 Four sizes, trained on the released annotations of the
 [SAM 3D Body dataset](https://huggingface.co/datasets/facebook/sam-3d-body-dataset).
 Accuracy is PA-MPJPE (lower is better) under the protocol of the paper; latency is per person,
-for the network as measured in the paper (the desktop column with TensorRT directly).
+for the model alone on the GPU as measured in the paper (the desktop column with TensorRT directly,
+up to a 6,890-vertex mesh).
 
 | Model | Parameters | EMDB-1 (mm) | 3DPW (mm) | RTX 4070, TensorRT (ms) | Galaxy S23 NPU (ms) | Licence |
 |---|---|---|---|---|---|---|
@@ -67,9 +68,12 @@ detector, then InstantHMR runs on all of them in one batch.
 | `--no-mesh` | skeleton only |
 | `--save-rrd` | also save the recording, to replay with `rerun file.rrd` |
 
-The detector is the slow stage (about 27 ms per frame for RF-DETR medium on an RTX 4070, against
-5 ms for InstantHMR with TensorRT). For a faster live demo, use `--detector nano` or
-`--detector-stride 2`.
+The latencies in the table above are the model alone on the GPU, as measured in the paper. The
+demo's timings are what a frame costs end to end in Python: on an RTX 4070 with TensorRT, the
+InstantHMR stage takes about 5 ms per person, of which 1.8 ms cut and normalise the crop on the CPU,
+1.3 ms run the network and 1.5 ms build the keypoints and the full 18,439-vertex mesh. The
+detector is the slow stage (about 27 ms for RF-DETR medium); for a faster live demo, use
+`--detector nano` or `--detector-stride 2`.
 
 ## Use it from Python
 
