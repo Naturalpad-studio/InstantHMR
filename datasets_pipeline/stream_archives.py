@@ -100,9 +100,8 @@ def main() -> None:
                    help="abort before an archive that would leave less than this")
     p.add_argument("--keep-frames", action="store_true",
                    help="do not delete the extracted frames after building")
-    p.add_argument("--sam3d-repo", type=Path,
-                   default=Path("/home/madjel/Projects/gitpackages/sam3-biomechanics/sam-3d-body"),
-                   help="for the undistortion scripts")
+    p.add_argument("--sam3d-repo", type=Path, default=Path("sam-3d-body"),
+                   help="clone of github.com/facebookresearch/sam-3d-body, for the undistortion scripts")
     p.add_argument("--undistort-python", default=sys.executable,
                    help="interpreter with pycolmap available (the "
                         "sam_3d_body_data env, not the training env)")
