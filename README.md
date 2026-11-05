@@ -1,5 +1,10 @@
 # InstantHMR: Real-Time Human Mesh Recovery on Your Phone
 
+<p align="center">
+  <a href="https://huggingface.co/momolesang/InstantHMR"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-ffc107" alt="Hugging Face models"></a>
+  <img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b" alt="arXiv: coming soon">
+</p>
+
 InstantHMR recovers the 3D body of every person in an image: pose, body shape, 70 keypoints in 2D
 and 3D, and a full body mesh in the [Momentum Human Rig](https://github.com/facebookresearch/MHR)
 (MHR). It runs in about 5 ms per person on a phone NPU and in about 1 ms on a desktop GPU.
