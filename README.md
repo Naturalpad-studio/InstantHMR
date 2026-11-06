@@ -143,9 +143,12 @@ was granted access to the HPC resources of IDRIS under the allocation AD01101711
 
 <!-- ticket 20: add the arXiv identifier. -->
 ```bibtex
-@article{adjel2026instanthmr,
-  title  = {InstantHMR: Real-Time Human Mesh Recovery on Your Phone},
-  author = {Adjel, Mohamed and Chalabi, Kahina and Bonnet, Vincent},
-  year   = {2026}
+@misc{adjel2026instanthmr,
+  title        = {InstantHMR: Real-Time Human Mesh Recovery on Your Phone},
+  author       = {Adjel, Mohamed and Chalabi, Kahina and Bonnet, Vincent},
+  year         = {2026},
+  howpublished = {HAL preprint hal-05854387},
+  url          = {https://hal.science/hal-05854387},
+  note         = {LAAS report no. 26486}
 }
 ```
