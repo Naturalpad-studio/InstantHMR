@@ -2,7 +2,7 @@
 
 <p align="center">
   <a href="https://huggingface.co/momolesang/InstantHMR"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Models-ffc107" alt="Hugging Face models"></a>
-  <img src="https://img.shields.io/badge/arXiv-coming%20soon-b31b1b" alt="arXiv: coming soon">
+  <a href="https://hal.science/hal-05854387"><img src="https://img.shields.io/badge/HAL-hal--05854387-b31b1b" alt="Paper on HAL"></a>
 </p>
 
 InstantHMR recovers the 3D body of every person in an image: pose, body shape, 70 keypoints in 2D
