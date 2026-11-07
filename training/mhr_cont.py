@@ -1,3 +1,6 @@
+# Transcribed from SAM 3D Body (sam_3d_body/models/modules/mhr_utils.py and geometry_utils.py),
+# Copyright (c) Meta Platforms, Inc. and affiliates. This file is distributed under the SAM License
+# (LICENSE-SAM at the repository root), not under the repository's Apache-2.0 licence.
 """SAM 3D Body's continuous MHR pose space, vendored for the student.
 
 The teacher's head does not emit the rig-native 204-vector. It emits a

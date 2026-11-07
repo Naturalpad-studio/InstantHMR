@@ -24,11 +24,11 @@ up to a 6,890-vertex mesh).
 
 | Model | Parameters | EMDB-1 (mm) | 3DPW (mm) | RTX 4070, TensorRT (ms) | Galaxy S23 NPU (ms) | Licence |
 |---|---|---|---|---|---|---|
-| `nano` | 20.0 M | 61.7 | 46.6 | 0.70 | 4.60 | CC BY-NC 4.0 |
-| `tiny` | 20.3 M | 58.0 | 44.0 | 0.73 | 4.84 | CC BY-NC 4.0 |
-| `small` | 24.4 M | 53.3 | 41.7 | 0.84 | 5.38 | CC BY-NC 4.0 |
-| `medium` (default) | 32.2 M | 48.8 | 40.0 | 0.98 | 5.49 | CC BY-NC 4.0 |
-| `medium-commercial` | 32.2 M | 72.2 | 50.7 | 0.98 | 5.49 | Apache-2.0 |
+| `nano` | 20.0 M | 61.7 | 46.6 | 0.70 | 4.60 | SAM License, non-commercial |
+| `tiny` | 20.3 M | 58.0 | 44.0 | 0.73 | 4.84 | SAM License, non-commercial |
+| `small` | 24.4 M | 53.3 | 41.7 | 0.84 | 5.38 | SAM License, non-commercial |
+| `medium` (default) | 32.2 M | 48.8 | 40.0 | 0.98 | 5.49 | SAM License, non-commercial |
+| `medium-commercial` | 32.2 M | 72.2 | 50.7 | 0.98 | 5.49 | SAM License |
 
 `medium-commercial` is the medium model trained only on images that allow commercial use
 (Harmony4D and part of COCO). The weights download automatically from
@@ -126,9 +126,19 @@ either way.
 
 ## Licence
 
-The code is under the [Apache-2.0](LICENSE) licence. The `nano`, `tiny`, `small` and `medium`
-weights are under [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/), for
-non-commercial use only, because some of their training images (SA-1B, AI Challenger) are; `medium-commercial` and the MHR body graph are under Apache-2.0. The body model is Meta's
+The code is under the [Apache-2.0](LICENSE) licence, except
+[`training/mhr_cont.py`](training/mhr_cont.py) and [`training/assets/`](training/assets/), which
+are derived from SAM 3D Body and are under the [SAM License](LICENSE-SAM).
+
+The weights, all five models and the shared `mhr-body.onnx`, are under the
+[SAM License](LICENSE-SAM): they are trained on the SAM 3D Body annotations, which Meta releases
+under that licence, and they contain tables from the SAM 3D Body checkpoint. The SAM License
+allows commercial use, under the conditions it lists (trade controls, no military use, among
+others). In addition, the `nano`, `tiny`, `small` and `medium` weights are for non-commercial
+use only, because some of their training images (SA-1B, AI Challenger, and COCO photos under
+non-commercial Flickr licences) are licensed for research or non-commercial use only.
+`medium-commercial` was trained only on images that allow commercial use and has no such
+restriction. The body model inside `mhr-body.onnx` is Meta's
 [MHR](https://github.com/facebookresearch/MHR) (Apache-2.0).
 
 ## Acknowledgements

@@ -202,15 +202,48 @@
 
 ================================================================================
 
-THIRD-PARTY NOTICES
--------------------
+FILES UNDER OTHER LICENCES, AND THIRD-PARTY NOTICES
+---------------------------------------------------
 
-The InstantHMR model weights distributed at
-https://huggingface.co/momolesang/InstantHMR are released under the SAM
-license, since the model is a distillation of Meta's SAM 3D Body
-(https://github.com/facebookresearch/sam-3d-body). Refer to that
-repository for the full SAM license text and applicable use restrictions.
+The Apache License above covers this repository except the files listed
+below.
 
-The demo uses Roboflow's RF-DETR for person detection, which is
-distributed under its own license. See https://github.com/roboflow/rf-detr
+SAM License. These files are derived from Meta's SAM 3D Body
+(https://github.com/facebookresearch/sam-3d-body) and from its annotations
+(https://huggingface.co/datasets/facebook/sam-3d-body-dataset), which Meta
+distributes under the SAM License. They are distributed under the SAM
+License, whose full text is in LICENSE-SAM:
+
+  training/mhr_cont.py   transcribed from sam_3d_body/models/modules/
+                         mhr_utils.py and geometry_utils.py,
+                         Copyright (c) Meta Platforms, Inc. and affiliates
+  training/assets/       tables extracted from the SAM 3D Body checkpoint
+                         (mhr_cont_head.npz, mhr_landmarks70.npz), or fitted
+                         to or measured on its annotations
+                         (mhr_j127_to_kp70.npy, mhr_size_bounds.npz,
+                         adapter_j14_h36m.npz)
+
+Model weights. The InstantHMR weights at
+https://huggingface.co/momolesang/InstantHMR are not part of this
+repository. They are trained on the SAM 3D Body annotations and contain
+tables from the SAM 3D Body checkpoint, so they are distributed under the
+SAM License. The nano, tiny, small and medium weights are, in addition,
+for non-commercial use only, because some of their training images (SA-1B,
+AI Challenger, and COCO photos under non-commercial Flickr licences) are
+licensed for research or non-commercial use only.
+
+MHR. The body model is Meta's Momentum Human Rig
+(https://github.com/facebookresearch/MHR), Copyright (c) Meta Platforms,
+Inc. and affiliates, licensed under the Apache License 2.0. This repository
+does not include it; the training and benchmark instructions download it
+from the MHR release. mhr-body.onnx on Hugging Face contains it.
+
+COCO. datasets_pipeline/assets/coco2014_train_licenses.csv lists the
+licence id of COCO 2014 training images, taken from the COCO annotations,
+which the COCO Consortium licenses under CC BY 4.0
+(https://creativecommons.org/licenses/by/4.0/). The photos themselves keep
+their own Flickr licences.
+
+RF-DETR. The demo uses Roboflow's RF-DETR for person detection, which is
+distributed under its own licence. See https://github.com/roboflow/rf-detr
 for terms.

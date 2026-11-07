@@ -1,0 +1,12 @@
+The files in this folder are derived from Meta's SAM 3D Body
+(https://github.com/facebookresearch/sam-3d-body) and its annotations
+(https://huggingface.co/datasets/facebook/sam-3d-body-dataset):
+
+  mhr_cont_head.npz      extracted from the SAM 3D Body checkpoint
+  mhr_landmarks70.npz    extracted from the SAM 3D Body checkpoint
+  mhr_j127_to_kp70.npy   fitted to the SAM 3D Body annotations
+  mhr_size_bounds.npz    measured on the SAM 3D Body annotations
+  adapter_j14_h36m.npz   fitted to the SAM 3D Body annotations
+
+They are distributed under the SAM License, not under the repository's
+Apache-2.0 licence. The full text is in LICENSE-SAM at the repository root.

@@ -10,10 +10,15 @@ the labels are the dataset's, not a teacher model's output.
 | `train.py` | The trainer: dataset, augmentation, model, MHR forward pass, losses, metrics, and a single-GPU loop. It also holds the self-checks (`--self-test`, `--overfit-test`). |
 | `train_ddp.py` | The entry point for real runs. It imports `train.py` and adds multi-GPU training (torchrun or Slurm), per-dataset mixture sampling, resume, and 3DPW validation. Without a launcher it runs as one process on one GPU. |
 | `val3dpw.py` | 3DPW validation used by `train_ddp.py --val-3dpw`. |
-| `mhr_cont.py` | The continuous MHR head (`--cont-head`). |
+| `mhr_cont.py` | The continuous MHR head (`--cont-head`), transcribed from SAM 3D Body. |
 | `assets/` | Small files the trainer reads: the keypoint regressor, the body-size bounds, the continuous-head and landmark tables, and the MHR-to-J14 adapter for 3DPW validation. |
 
 A change to the model or a loss goes in `train.py`, so both entry points get it.
+
+`mhr_cont.py` and `assets/` are derived from SAM 3D Body and are under the
+[SAM License](../LICENSE-SAM), not Apache-2.0. A model trained with this folder
+inherits it: it learns from annotations Meta releases under that licence, and
+`--cont-head` stores SAM 3D Body tables in its weights.
 
 ## Setup
 
