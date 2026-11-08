@@ -9,9 +9,14 @@ InstantHMR recovers the 3D body of every person in an image: pose, body shape, 7
 and 3D, and a full body mesh in the [Momentum Human Rig](https://github.com/facebookresearch/MHR)
 (MHR). It runs in about 5 ms per person on a phone NPU and in about 1 ms on a desktop GPU.
 
-**New in v1.1:** a kinematic fit inside the model graph refines each pose against the network's own
-2D keypoints (`--fit`, on by default), and two pose filters for video (`--pose-filter`). See
-[Kinematic fit](#kinematic-fit).
+## News
+
+- **[2026-11-08] v1.1:** a kinematic fit inside the model graph refines each pose against the
+  network's own 2D keypoints (`--fit`, on by default), and two pose filters for video
+  (`--pose-filter`). See [Kinematic fit](#kinematic-fit).
+- **[2026-11-06] v1.0:** first release: four model sizes and a commercially usable medium model as
+  ONNX graphs, the demo, training code and the dataset pipeline. Paper on
+  [HAL](https://hal.science/hal-05854387).
 
 <p align="center">
   <img src="assets/demo_desktop.gif" height="300" alt="InstantHMR on a desktop GPU, shown in the Rerun viewer">
