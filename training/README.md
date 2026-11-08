@@ -136,3 +136,13 @@ python demo.py --image photo.jpg --model models/my-model.onnx
 The first graph is the network; the second turns its MHR parameters into the 70 3D keypoints and
 the mesh, and the demo looks for it next to the model. The exporter reads the training settings
 from the `run_config.json` beside the checkpoint, so keep the two together.
+
+To export the network with the kinematic fit (on 1 or 2 crops per person), add `--fit`:
+
+```bash
+python tools/export_onnx.py --ckpt runs/medium/best_student_model_v3.pth --fit 2 --output models/my-model-fit2.onnx
+python demo.py --video clip.mp4 --model models/my-model-fit2.onnx
+```
+
+This graph is fp16 by default, which needs a CUDA GPU to trace (`--fp32` otherwise). It reads the
+MHR rig from `training/checkpoints/mhr_model.pt`, like `--body`.

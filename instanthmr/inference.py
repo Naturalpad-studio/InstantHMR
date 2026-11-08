@@ -16,6 +16,9 @@ CROP_EXPAND = 1.2
 # Focal used when the camera is not calibrated, as a multiple of the image diagonal
 # (about 50 degrees of horizontal field of view on a 16:9 frame).
 FOCAL_FALLBACK_DIAG = 1.05
+# The kinematic-fit graphs' crop scales (0.9 and 0.7 of the box) were chosen on ground-truth person boxes; RF-DETR's
+# boxes are tighter (median long side 0.866 of the ground-truth box), so they are enlarged by this factor first.
+DETECTOR_TO_GT_BOX = 1 / 0.866
 DEVICES = ("cuda", "tensorrt", "cpu", "coreml")
 
 
@@ -73,16 +76,18 @@ def providers_for(device: str, max_batch: int = 1, image_size: int = 288,
 
 
 class InstantHMR:
-    """An exported InstantHMR network and the MHR body graph that turns its output into 3D.
+    """An exported InstantHMR graph and the MHR body graph that turns its output into 3D.
 
-    `device` runs the network ("cuda", "tensorrt", "cpu" or "coreml"); the body graph runs on
-    CUDA when the network does, else on the CPU. `focal` is the camera focal length in pixels
-    when it is known; otherwise 1.05 x the image diagonal is assumed. `max_batch` is the most
-    people predicted in one call (TensorRT builds its engine for batches up to it).
+    The graph is either a network (`instanthmr-<size>.onnx`) or a network + kinematic fit
+    (`instanthmr-<size>-fit<1|2>.onnx`, read from its metadata), which refines the pose on 1 or 2 crops per
+    person. `device` runs it ("cuda", "tensorrt", "cpu" or "coreml"); the body graph runs on CUDA when the
+    graph does, else on the CPU. `focal` is the camera focal length in pixels when it is known; otherwise
+    1.05 x the image diagonal is assumed. `max_batch` is the most people predicted in one call. `pose_filter`
+    (smoothing.PoseFilter) filters each person's pose across frames before the mesh is built.
     """
 
     def __init__(self, model_path: str | Path, body_path: str | Path | None = None, device: str = "cuda",
-                 focal: float | None = None, max_batch: int = 4):
+                 focal: float | None = None, max_batch: int = 4, pose_filter=None):
         import onnxruntime as ort
 
         from .models import resolve_body
@@ -96,19 +101,25 @@ class InstantHMR:
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         options.log_severity_level = 3
 
-        size = 288
-        if device == "tensorrt":   # the engine profile needs the crop size before the session exists
-            probe = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-            size = int(probe.get_modelmeta().custom_metadata_map.get("image_size", size))
-            del probe
-        self.network = ort.InferenceSession(str(model_path), sess_options=options,
-                                            providers=providers_for(device, max_batch, size))
-        self.provider = self.network.get_providers()[0]
-        meta = self.network.get_modelmeta().custom_metadata_map
-        self.input_size = int(meta.get("image_size", size))
+        probe = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        meta = probe.get_modelmeta().custom_metadata_map
+        self.input_size = int(meta.get("image_size", 288))
         self.cliff_focal = meta.get("cliff_focal", "true") == "true"
+        self.n_crops = int(meta.get("crops", 0))            # 0: a network graph; 1 or 2: network + kinematic fit
+        self.scales = tuple(float(v) for v in meta["crop_scales"].split(",")) if self.n_crops else (1.0,)
+        del probe
+        if self.n_crops:
+            providers = _fit_providers(device, Path(model_path).stem)
+        else:
+            providers = providers_for(device, max_batch, self.input_size)
+        self.network = ort.InferenceSession(str(model_path), sess_options=options, providers=providers)
+        self.provider = self.network.get_providers()[0]
         self.focal = focal
         self.max_batch = max_batch
+        self.pose_filter = pose_filter
+        self._binding = None
+        if self.n_crops and self.provider == "CUDAExecutionProvider":
+            self._bind_cuda_graph(ort)
 
         body_path = Path(body_path) if body_path else resolve_body(Path(model_path))
         self.body = ort.InferenceSession(str(body_path), sess_options=options,
@@ -123,61 +134,118 @@ class InstantHMR:
         return (FOCAL_FALLBACK_DIAG if self.cliff_focal else 1.0) * math.hypot(h, w)
 
     def predict(self, image_rgb: np.ndarray, bboxes: Sequence, confidences: Sequence[float] | None = None,
-                focal: float | None = None) -> list[HMRPrediction]:
-        """All people of one frame in a single call. `bboxes` are tight person boxes, x1 y1 x2 y2."""
+                focal: float | None = None, timestamp: float | None = None) -> list[HMRPrediction]:
+        """All people of one frame. `bboxes` are tight person boxes (as a detector gives them), x1 y1 x2 y2;
+        `timestamp` (seconds) is only read by the pose filter."""
         if len(bboxes) == 0:
             return []
         h, w = image_rgb.shape[:2]
         f = self.focal_px(h, w, focal)
-        crops, cliffs, squares = zip(*(self._preprocess(image_rgb, np.asarray(b, np.float32), f) for b in bboxes))
-        crops, cliffs = np.stack(crops), np.stack(cliffs)
-        chunks = [self._run(crops[i:i + self.max_batch], cliffs[i:i + self.max_batch])
-                  for i in range(0, len(crops), self.max_batch)]
-        outs = {k: np.concatenate([c[k] for c in chunks]) for k in chunks[0]}
-        confidences = confidences if confidences is not None else [1.0] * len(bboxes)
+        boxes = [np.asarray(b, np.float32) for b in bboxes]
+        outs = self._estimate_fit(image_rgb, boxes, f) if self.n_crops else self._estimate(image_rgb, boxes, f)
+        if self.pose_filter is not None:
+            outs["mhr_params"] = self.pose_filter(boxes, outs["mhr_params"], timestamp)
+        joints_3d, vertices = self.body.run(["joints_3d", "vertices"], {"mhr_params": outs["mhr_params"],
+                                                                        "shape_params": outs["shape_params"]})
+        confidences = confidences if confidences is not None else [1.0] * len(boxes)
+        return [HMRPrediction(bbox=boxes[i], confidence=float(confidences[i]), joints_2d=outs["joints_2d"][i],
+                              joints_3d_local=joints_3d[i], cam_trans=outs["cam_trans"][i],
+                              mhr_params=outs["mhr_params"][i], shape_params=outs["shape_params"][i],
+                              focal_length=f, image_shape=(h, w), vertices_local=vertices[i])
+                for i in range(len(boxes))]
 
-        results = []
-        for i, (x0, y0, side) in enumerate(squares):
-            j2d = (outs["joints_2d"][i] + 1.0) * 0.5 * side + np.array([x0, y0], np.float32)
-            results.append(HMRPrediction(
-                bbox=np.asarray(bboxes[i], np.float32), confidence=float(confidences[i]),
-                joints_2d=j2d.astype(np.float32), joints_3d_local=outs["joints_3d"][i],
-                cam_trans=outs["cam_trans"][i], mhr_params=outs["mhr_params"][i],
-                shape_params=outs["shape_params"][i], focal_length=f, image_shape=(h, w),
-                vertices_local=outs["vertices"][i]))
-        return results
-
-    def _run(self, crops: np.ndarray, cliffs: np.ndarray) -> dict[str, np.ndarray]:
+    def _estimate(self, image_rgb, boxes, f) -> dict[str, np.ndarray]:
+        """The network graph: one crop per person, batches of up to `max_batch`; 2D in pixels."""
         names = ["mhr_params", "shape_params", "cam_trans", "joints_2d"]
-        outs = dict(zip(names, self.network.run(names, {"image": crops, "cliff_cond": cliffs})))
-        outs.update(zip(["joints_3d", "vertices"], self.body.run(
-            ["joints_3d", "vertices"], {"mhr_params": outs["mhr_params"], "shape_params": outs["shape_params"]})))
+        crops, cliffs, squares = zip(*(self._crop(image_rgb, b, 1.0, f) for b in boxes))
+        crops = np.stack([_normalise(c) for c in crops])
+        cliffs = np.stack(cliffs)
+        chunks = [self.network.run(names, {"image": crops[i:i + self.max_batch], "cliff_cond": cliffs[i:i + self.max_batch]})
+                  for i in range(0, len(crops), self.max_batch)]
+        outs = {k: np.concatenate([c[j] for c in chunks]) for j, k in enumerate(names)}
+        sq = np.asarray(squares, np.float32)                                    # (P, 4) x1, y1, w, h
+        outs["joints_2d"] = (outs["joints_2d"] + 1.0) * 0.5 * sq[:, None, 2:] + sq[:, None, :2]
         return outs
 
-    def warmup(self, max_batch: int = 1) -> None:
-        for n in sorted({1, max_batch}):
-            self.network.run(None, {"image": np.zeros((n, 3, self.input_size, self.input_size), np.float32),
-                                    "cliff_cond": np.zeros((n, 3), np.float32)})
-            self.body.run(None, {"mhr_params": np.zeros((n, 204), np.float32),
-                                 "shape_params": np.zeros((n, 45), np.float32)})
+    def _estimate_fit(self, image_rgb, boxes, f) -> dict[str, np.ndarray]:
+        """The network + fit graph: one call per person on its 1 or 2 crops; 2D in pixels."""
+        h, w = image_rgb.shape[:2]
+        cam = np.array([[f, w / 2.0, h / 2.0]], np.float32)
+        per_person = []
+        for b in boxes:
+            c, half = (b[:2] + b[2:]) / 2, (b[2:] - b[:2]) * DETECTOR_TO_GT_BOX / 2
+            gt_box = np.concatenate([c - half, c + half])
+            crops, cliffs, squares = zip(*(self._crop(image_rgb, gt_box, s, f) for s in self.scales))
+            per_person.append(self._run_fit({"image": np.stack(crops), "cliff_cond": np.stack(cliffs),
+                                             "crop_box": np.asarray(squares, np.float32), "cam": cam}))
+        return {k: np.concatenate([o[k] for o in per_person]) for k in per_person[0]}
 
-    def _preprocess(self, image_rgb: np.ndarray, bbox: np.ndarray, focal: float):
-        """The square 1.2x crop the model was trained on, and its CLIFF conditioning vector."""
+    def _run_fit(self, feeds: dict) -> dict[str, np.ndarray]:
+        names = ["mhr_params", "shape_params", "cam_trans", "joints_2d"]
+        if self._binding is None:
+            return dict(zip(names, self.network.run(names, feeds)))
+        for k, v in feeds.items():
+            self._inputs[k].update_inplace(np.ascontiguousarray(v))
+        self.network.run_with_iobinding(self._binding)
+        return dict(zip(names, (o.numpy() for o in self._binding.get_outputs())))
+
+    def _bind_cuda_graph(self, ort) -> None:
+        """ORT CUDA: fixed device buffers for every input and output, so the first run is captured as one CUDA
+        graph and every later run replays it."""
+        n, s = self.n_crops, self.input_size
+        shapes = {"image": ((n, s, s, 3), np.uint8), "cliff_cond": ((n, 3), np.float32),
+                  "crop_box": ((n, 4), np.float32), "cam": ((1, 3), np.float32)}
+        self._inputs = {k: ort.OrtValue.ortvalue_from_numpy(np.zeros(*v), "cuda", 0) for k, v in shapes.items()}
+        self._binding = self.network.io_binding()
+        for k, v in self._inputs.items():
+            self._binding.bind_ortvalue_input(k, v)
+        for k in ("mhr_params", "shape_params", "cam_trans", "joints_2d"):
+            self._binding.bind_output(k, "cuda", 0)
+
+    def warmup(self, max_batch: int = 1) -> None:
+        image, pose_filter, self.pose_filter = np.zeros((480, 640, 3), np.uint8), self.pose_filter, None
+        try:
+            for n in sorted({1, max_batch}):
+                self.predict(image, [[200, 100, 400, 450]] * n)
+        finally:
+            self.pose_filter = pose_filter
+
+    def _crop(self, image_rgb: np.ndarray, bbox: np.ndarray, scale: float, focal: float):
+        """The square 1.2x crop of the box scaled by `scale` about its centre, as uint8, cut and resized by one
+        affine warp (the same sampling as cropping then resizing); its CLIFF vector and pixel square."""
         h, w = image_rgb.shape[:2]
         x1, y1, x2, y2 = bbox.astype(np.float64)
-        cx, cy, size = (x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1)
+        cx, cy, size = (x1 + x2) / 2, (y1 + y2) / 2, max(x2 - x1, y2 - y1) * scale
         if self.cliff_focal:
             cliff = [math.atan((cx - w / 2) / focal), math.atan((cy - h / 2) / focal), size / focal]
         else:
             cliff = [2 * cx / w - 1, 2 * cy / h - 1, size / max(w, h)]
-
         side = size * CROP_EXPAND
-        sx, sy = cx - side / 2, cy - side / 2
-        ix1, iy1 = math.floor(sx), math.floor(sy)
-        ix2, iy2 = math.ceil(sx + side), math.ceil(sy + side)
-        patch = image_rgb[max(0, iy1):min(h, iy2), max(0, ix1):min(w, ix2)]
-        patch = cv2.copyMakeBorder(patch, max(0, -iy1), max(0, iy2 - h), max(0, -ix1), max(0, ix2 - w),
-                                   cv2.BORDER_CONSTANT, value=(0, 0, 0))
-        crop = cv2.resize(patch, (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR)
-        crop = ((crop.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1)
-        return np.ascontiguousarray(crop), np.asarray(cliff, np.float32), (float(sx), float(sy), float(side))
+        ix1, iy1 = math.floor(cx - side / 2), math.floor(cy - side / 2)
+        ix2, iy2 = math.ceil(cx - side / 2 + side), math.ceil(cy - side / 2 + side)
+        s = self.input_size
+        sx, sy = (ix2 - ix1) / s, (iy2 - iy1) / s
+        m = np.array([[sx, 0, ix1 + 0.5 * sx - 0.5], [0, sy, iy1 + 0.5 * sy - 0.5]], np.float64)
+        crop = cv2.warpAffine(image_rgb, m, (s, s), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        return crop, np.asarray(cliff, np.float32), (float(ix1), float(iy1), float(ix2 - ix1), float(iy2 - iy1))
+
+
+def _normalise(crop: np.ndarray) -> np.ndarray:
+    """uint8 HWC -> ImageNet-normalised float32 CHW, the network graphs' input."""
+    return np.ascontiguousarray(((crop.astype(np.float32) / 255.0 - IMAGENET_MEAN) / IMAGENET_STD).transpose(2, 0, 1))
+
+
+def _fit_providers(device: str, name: str, cache_dir: str | Path = "models/trt_cache") -> list:
+    """Providers for a fit graph (fixed shapes): TensorRT in fp16 with a cached engine, or ORT CUDA with CUDA graphs."""
+    if device == "tensorrt":
+        providers = providers_for(device)                 # checks the installation
+        cache = Path(cache_dir) / name
+        cache.mkdir(parents=True, exist_ok=True)
+        return [("TensorrtExecutionProvider", {"trt_fp16_enable": True, "trt_engine_cache_enable": True,
+                                               "trt_engine_cache_path": str(cache), "trt_timing_cache_enable": True,
+                                               "trt_timing_cache_path": str(cache)}), *providers[1:]]
+    if device == "cuda":
+        providers_for(device)
+        return [("CUDAExecutionProvider", {"enable_cuda_graph": "1"}), "CPUExecutionProvider"]
+    return providers_for(device)
