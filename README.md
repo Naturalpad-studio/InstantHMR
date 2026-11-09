@@ -180,8 +180,9 @@ restriction. The body model inside `mhr-body.onnx` is Meta's
 InstantHMR is trained on the annotations Meta released with
 [SAM 3D Body](https://github.com/facebookresearch/sam-3d-body) and uses Meta's
 [MHR](https://github.com/facebookresearch/MHR) body model. People are detected with
-[RF-DETR](https://github.com/roboflow/rf-detr) and shown with [Rerun](https://rerun.io). Training
-was granted access to the HPC resources of IDRIS under the allocation AD011017116 made by GENCI.
+[RF-DETR](https://github.com/roboflow/rf-detr) and shown with [Rerun](https://rerun.io). This
+project was provided with computer and storage resources by GENCI at IDRIS thanks to the grant
+2025-AD011017116 on the V100 partition of the supercomputer Jean Zay.
 
 ## Citation
 
