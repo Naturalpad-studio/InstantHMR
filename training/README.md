@@ -90,6 +90,43 @@ torchrun --standalone --nproc_per_node=4 training/train_ddp.py \
 These commands rebuild the exact settings recorded in each released model's
 `run_config.json`.
 
+## Fine-tuning a released model
+
+The PyTorch checkpoints of the five released models are on
+[Hugging Face](https://huggingface.co/momolesang/InstantHMR/tree/main/pytorch),
+one folder per model with its `run_config.json`:
+
+```bash
+hf download momolesang/InstantHMR --include "pytorch/medium-commercial/*" --local-dir .
+```
+
+Start a new run from them with `--init-from`. It loads the weights (and the
+EMA copy starts from them too), and keeps a fresh optimiser and learning-rate
+schedule. Use the flags of that model's training command above, so that the
+model built matches the checkpoint (a mismatched key stops the run), and
+replace `--mix`, `--data_root` and the length of the run with your own:
+
+```bash
+torchrun --standalone --nproc_per_node=1 training/train_ddp.py \
+    --init-from pytorch/medium-commercial/instanthmr-medium-commercial.pth \
+    --data_root <data> --output_dir runs/my-finetune \
+    --mix mydata=0.5,harmony4d=0.25,coco=0.25 \
+    --epochs <fewer> --lr <lower> ...   # the other flags as in the model's command
+```
+
+`--mix` keys select the `sam3d_gt_<name>` folders in `--data_root`, so your
+data must be in the same format (see `datasets_pipeline/`). Keeping some of
+the original data in the mix limits forgetting. Do not resume a released
+checkpoint as if it were your own `last.pth`: it holds the weights only, and
+resuming continues the original 600-epoch schedule.
+
+Each model's settings (`backbone`, `mix`, `cliff_focal`, ...) are in its
+`run_config.json`. Keep `--cliff-focal`: all five models use it, and since it
+changes what the box vector means rather than any weight, leaving it out
+raises no error and silently misplaces people in depth. The exporter reads it
+from the `run_config.json` that `train_ddp.py` writes in `--output_dir`, next
+to your new checkpoints.
+
 A run writes `last.pth` every epoch and resumes from it when relaunched with the
 same command. `best_student_model_v3.pth` is the checkpoint with the best 3DPW
 validation score.

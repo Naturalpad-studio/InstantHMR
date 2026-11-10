@@ -11,6 +11,9 @@ and 3D, and a full body mesh in the [Momentum Human Rig](https://github.com/face
 
 ## News
 
+- **[2026-11-10]** PyTorch checkpoints of the five models, with their `run_config.json`, on
+  [Hugging Face](https://huggingface.co/momolesang/InstantHMR/tree/main/pytorch), to fine-tune them
+  on your own data. See [Fine-tuning a released model](training/README.md#fine-tuning-a-released-model).
 - **[2026-11-08] v1.1:** a kinematic fit inside the model graph refines each pose against the
   network's own 2D keypoints (`--fit`, on by default), and two pose filters for video
   (`--pose-filter`). See [Kinematic fit](#kinematic-fit).
@@ -153,7 +156,7 @@ installation to be fast.
 ## Training and evaluation
 
 - [`training/`](training/README.md): train the released models, or your own, from the SAM 3D Body
-  annotations, and export them to ONNX.
+  annotations, fine-tune a released model, and export them to ONNX.
 - [`datasets_pipeline/`](datasets_pipeline/README.md): download the annotations and images and
   build the training data.
 - [`benchmark/`](benchmark/README.md): reproduce the paper's EMDB-1 and 3DPW numbers.
@@ -164,7 +167,8 @@ The code is under the [Apache-2.0](LICENSE) licence, except
 [`training/mhr_cont.py`](training/mhr_cont.py) and [`training/assets/`](training/assets/), which
 are derived from SAM 3D Body and are under the [SAM License](LICENSE-SAM).
 
-The weights, all five models (with and without the fit) and the shared `mhr-body.onnx`, are under the
+The weights, all five models (with and without the fit, and their PyTorch checkpoints) and the shared
+`mhr-body.onnx`, are under the
 [SAM License](LICENSE-SAM): they are trained on the SAM 3D Body annotations, which Meta releases
 under that licence, and they contain tables from the SAM 3D Body checkpoint. The SAM License
 allows commercial use, under the conditions it lists (trade controls, no military use, among
