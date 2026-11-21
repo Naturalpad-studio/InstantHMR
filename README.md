@@ -86,6 +86,26 @@ The first `pip` line installs PyTorch for CUDA 12, which the person detector use
 shares, so a single set of CUDA libraries is installed. On a Mac, or without an NVIDIA GPU, skip
 it.
 
+### Windows
+
+The commands above are bash; on Windows there is a one-click script and three launchers instead:
+
+```bat
+setup_windows.bat                     :: create .venv (py -3.12), install CUDA 12.6 wheels
+setup_windows.bat --check             :: only report what is installed
+setup_windows.bat --proxy http://127.0.0.1:21882
+run_image.bat assets\test_zidane.jpg
+run_video.bat clip.mp4
+run_camera.bat 0
+```
+
+`setup_windows.bat` installs the CUDA wheels (falling back to CPU with a warning), installs
+`requirements.txt`, pre-downloads the ONNX graphs through `tools/prefetch_models.py` and prints a
+report (`torch ... cuda: True <GPU>`, onnxruntime providers). The launchers put the cuDNN/cuBLAS
+DLL directories on `PATH`, pick default weights and pass extra `demo.py` arguments through.
+Details, model sizes and troubleshooting: [WINDOWS.md](WINDOWS.md) (Chinese), measured numbers
+in [RUN.md](RUN.md).
+
 ## Demo
 
 ```bash
