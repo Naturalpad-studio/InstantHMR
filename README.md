@@ -103,8 +103,8 @@ run_camera.bat 0
 `requirements.txt`, pre-downloads the ONNX graphs through `tools/prefetch_models.py` and prints a
 report (`torch ... cuda: True <GPU>`, onnxruntime providers). The launchers put the cuDNN/cuBLAS
 DLL directories on `PATH`, pick default weights and pass extra `demo.py` arguments through.
-Details, model sizes and troubleshooting: [WINDOWS.md](WINDOWS.md) (Chinese), measured numbers
-in [RUN.md](RUN.md).
+Details, model sizes and troubleshooting: [WINDOWS.md](WINDOWS.md) (English) or
+[WINDOWS.zh.md](WINDOWS.zh.md) (Chinese); measured numbers in [RUN.md](RUN.md).
 
 ## Demo
 
